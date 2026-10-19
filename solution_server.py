@@ -27,6 +27,15 @@ import argparse
 import asyncio
 import json
 from typing import Any
+from collections import deque
+from data_structs import Caption, ClientState
+from revision_state_manager import RevisionStateManager
+
+# Uncomment if needed, delete if no need
+# @dataclass
+# class Update:
+#   caption : Caption
+#   data : bytes   #encoded in json
 
 import websockets
 
@@ -34,6 +43,11 @@ import websockets
 # There is deliberately no per-client queue or recovery state here.
 CLIENTS: set[Any] = set()
 
+finals_log: deque[Caption] #finals in segment order, then must before appending a new 
+                           # final, pop left updates that is past the 90s
+                           
+active: Caption | None
+clients: dict[int, ClientState] #per-client delivery state
 
 async def broadcast_naively(raw_message: str) -> None:
     """Send one message directly to every connected client.
