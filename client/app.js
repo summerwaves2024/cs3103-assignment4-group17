@@ -43,7 +43,7 @@ function applyCaption(msg) {
     if (existingCaption.final) {
       return
     }
-    if (msg.revision <= existing.revision) {
+    if (msg.revision <= existingCaption.revision) {
       return
     }
   }
@@ -56,7 +56,7 @@ function applyCaption(msg) {
   let line = elements.get(msg.segment)
 
   if (!line) {
-    row = document.createElement('div')
+    line = document.createElement('div')
     elements.set(msg.segment, line)
     liveEl.appendChild(line)
   }
@@ -94,7 +94,7 @@ function connect() {
         applyCaption(item)
       }
 
-      if (msg.caption) {
+      if (msg.active) {
         applyCaption(msg.item)
       }
     }
