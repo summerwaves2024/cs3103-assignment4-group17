@@ -60,7 +60,9 @@ function applyCaption(msg) {
     elements.set(msg.segment, line)
     liveEl.appendChild(line)
   }
-  line.className = msg.final ? "final-line" : "provisional-line";
+  line.className = "caption-row";
+  line.classList.add(msg.final ? "final-line" : "provisional-line");
+  
   line.textContent = `[${msg.final ? "FINAL" : "PROVISIONAL"}] ` +
     `segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
   
@@ -95,7 +97,7 @@ function connect() {
       }
 
       if (msg.active) {
-        applyCaption(msg.item)
+        applyCaption(msg.active)
       }
     }
   });
