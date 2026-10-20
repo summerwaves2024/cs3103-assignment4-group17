@@ -37,7 +37,7 @@ function numericClientId() {
 
 function applyCaption(msg) {
   const existingCaption = captions.get(msg.segment)
-
+  
   // updating the caption
   if (existingCaption) {
     if (existingCaption.final) {
@@ -62,11 +62,9 @@ function applyCaption(msg) {
   }
   line.className = "caption-row";
   line.classList.add(msg.final ? "final-line" : "provisional-line");
-  
+
   line.textContent = `[${msg.final ? "FINAL" : "PROVISIONAL"}] ` +
     `segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
-  
-
 }
 
 function connect() {

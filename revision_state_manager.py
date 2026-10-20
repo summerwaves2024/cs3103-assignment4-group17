@@ -20,5 +20,3 @@ class RevisionStateManager:
 
     def get_segment(self, segment_id : int) -> Caption:
             return self._segments.get(segment_id)
-
-    
