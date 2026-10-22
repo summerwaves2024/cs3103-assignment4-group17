@@ -68,10 +68,32 @@ async def broadcast_naively(raw_message: str) -> None:
         if isinstance(result, Exception):
             CLIENTS.discard(client)
 
+async def broadcast_naively(raw_message: str) -> None:
+    """Send one message directly to every connected client.
+
+    This is intentionally a naive baseline. The source handler waits for all
+    sends to complete. Under pressure, this design may accumulate delay and is
+    not the target architecture for the assignment.
+    """
+    if not CLIENTS:
+        return
+
+    snapshot = list(CLIENTS)
+    results = await asyncio.gather(
+        *(client.send(raw_message) for client in snapshot),
+        return_exceptions=True,
+    )
+    for client, result in zip(snapshot, results):
+        if isinstance(result, Exception):
+            CLIENTS.discard(client)
+
+
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
     session = hello.get("session")
     print(f"source connected: session={session}", flush=True)
+
+    rsm = RevisionStateManager(session)
 
     try:
         async for raw in ws:
@@ -84,7 +106,10 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
             if msg_type == "CAPTION_UPDATE":
                 # Baseline behavior: forward exactly what was received.
                 # No history, state, validation, coalescing, or bounded queues.
-                await broadcast_naively(raw)
+                caption : Caption = Caption.from_dict(msg)
+                is_accepted, is_out_of_order = rsm.process_caption(caption)
+                if is_accepted:
+                    await broadcast_naively(raw)
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
