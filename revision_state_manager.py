@@ -11,12 +11,15 @@ class RevisionStateManager:
     def __init__(self):
         self._segments: dict[int, Caption] = {}
 
+    # Updates segments if caption is accepted (e.g. revision_no not outdated)
     # out: (is_accepted, is_out_of_order)
-    def update_caption(c : Caption) -> tuple[bool, bool]:
+    def update_caption(self, c : Caption) -> tuple[bool, bool]:
         return True, True
 
     def get_segments(self) -> dict[int, Caption]:
         return self._segments
 
-    def get_segment(self, segment_id : int) -> Caption:
-            return self._segments.get(segment_id)
+    def get_segment(self, segment_id : int) -> Caption | None:
+        return self._segments.get(segment_id)
+
+    

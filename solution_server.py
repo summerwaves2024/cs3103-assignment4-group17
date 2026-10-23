@@ -28,7 +28,7 @@ import asyncio
 import json
 from typing import Any
 from collections import deque
-from data_structs import Caption, ClientState
+from data_structs import Caption, ClientState, ClientStatus
 from revision_state_manager import RevisionStateManager
 
 # Uncomment if needed, delete if no need
