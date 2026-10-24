@@ -41,7 +41,7 @@ class RevisionStateManager:
         if revision_diff <= 0 or curr_seg.final:
             return False, False
 
-        # Remainder are all valid segments
+        # Remainder are all valid segments (not necessarily in order)
         is_out_of_order = self.add_to_segments(c, cap_seg_id)
                 
         return True, is_out_of_order
