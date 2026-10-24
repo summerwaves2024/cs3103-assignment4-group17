@@ -1,8 +1,8 @@
-# Team XX - LiveRecall
+# Team 17 - LiveRecall
 
 ## Team members
 
-- Name / student ID / responsibility
+- Ong Li Min / A0309313M / responsibility
 
 ## Ubuntu setup
 
