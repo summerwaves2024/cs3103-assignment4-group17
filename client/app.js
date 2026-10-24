@@ -22,6 +22,8 @@ const liveEl = document.getElementById("live");
 const recallEl = document.getElementById("recall");
 
 let ws;
+const captions = new Map(); // segment -> latest caption
+const elements = new Map(); // segment -> DOM element
 
 function numericClientId() {
   const key = "liverecall-client-id";
@@ -33,13 +35,36 @@ function numericClientId() {
   return Number(value);
 }
 
-function appendNaively(msg) {
-  const row = document.createElement("div");
-  row.className = "naive-line";
-  const state = msg.final ? "FINAL" : "PROVISIONAL";
-  row.textContent = `[${state}] segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
-  liveEl.appendChild(row);
-  liveEl.scrollTop = liveEl.scrollHeight;
+function applyCaption(msg) {
+  const existingCaption = captions.get(msg.segment)
+  
+  // updating the caption
+  if (existingCaption) {
+    if (existingCaption.final) {
+      return
+    }
+    if (msg.revision <= existingCaption.revision) {
+      return
+    }
+  }
+
+  captions.set(msg.segment, msg)
+
+  // the general idea is 
+  // new segment -> create a new line
+  // new revision -> update the existing line
+  let line = elements.get(msg.segment)
+
+  if (!line) {
+    line = document.createElement('div')
+    elements.set(msg.segment, line)
+    liveEl.appendChild(line)
+  }
+  line.className = "caption-row";
+  line.classList.add(msg.final ? "final-line" : "provisional-line");
+
+  line.textContent = `[${msg.final ? "FINAL" : "PROVISIONAL"}] ` +
+    `segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
 }
 
 function connect() {
@@ -61,10 +86,17 @@ function connect() {
   ws.addEventListener("message", (event) => {
     const msg = JSON.parse(event.data);
     if (msg.type === "CAPTION_UPDATE") {
-      appendNaively(msg);
+      applyCaption(msg);
     } else if (msg.type === "HISTORY") {
       console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
-      // TODO: merge history without stale/duplicate final captions.
+      // merge history without stale/duplicate final captions.
+      for (const item of msg.items ?? []) {
+        applyCaption(item)
+      }
+
+      if (msg.active) {
+        applyCaption(msg.active)
+      }
     }
   });
 

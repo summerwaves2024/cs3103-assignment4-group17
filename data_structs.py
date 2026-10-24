@@ -1,3 +1,5 @@
+import asyncio
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 
@@ -6,7 +8,6 @@ class ClientStatus(Enum):
     LAGGING = 2
     COMPLETED = 3
     RECONNECTING = 4
-
 
 @dataclass
 class Caption:
@@ -23,7 +24,7 @@ class ClientState:
   ws : object # WebSocket Object
   pending_finals : deque[Caption]
   pending_active : Caption | None
-  mode : Status # True -> “normal” or False -> “lagging”
+  mode : ClientStatus # True -> “normal” or False -> “lagging”
   last_final : tuple[int, int]  # (segment, revision)
   wake : asyncio.Event # tell the sender task there is work to do 
                        # so we can individually send rather than broadcast
