@@ -22,6 +22,9 @@ const liveEl = document.getElementById("live");
 const recallEl = document.getElementById("recall");
 
 let ws;
+let lastFinal = { segment: 0, revision: 0 };
+let retryAttempt = 0;
+let retryTimer = null;
 const captions = new Map(); // segment -> latest caption
 const elements = new Map(); // segment -> DOM element
 
@@ -49,6 +52,9 @@ function applyCaption(msg) {
   }
 
   captions.set(msg.segment, msg)
+  if (msg.final && msg.segment > lastFinal.segment) {
+  lastFinal = { segment: msg.segment, revision: msg.revision };
+  }
 
   // the general idea is 
   // new segment -> create a new line
@@ -67,8 +73,23 @@ function applyCaption(msg) {
     `segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
 }
 
+function scheduleReconnect() {
+  if (retryTimer !== null) return;
+
+  // make each failed attempt wait longer: 0.5s, 1s, 2s up to 10s max
+  const delay = Math.min(10000, 500 * 2 ** retryAttempt++);
+  statusEl.textContent = `reconnecting in ${(delay / 1000).toFixed(1)} s`;
+
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    connect();
+  }, delay);
+}
+
 function connect() {
-  statusEl.textContent = "connecting";
+  statusEl.textContent = 
+  lastFinal.segment === 0 ? "connecting..." : "reconnecting...";
+
   ws = new WebSocket(WS_URL);
 
   ws.addEventListener("open", () => {
@@ -77,9 +98,9 @@ function connect() {
       type: "CLIENT_HELLO",
       client_id: numericClientId(),
       session: "L1",
-      last_segment: 0,       // TODO: resume latest finalized state
-      last_revision: 0,
-      history_seconds: 30
+      last_segment: lastFinal.segment,       // TODO: resume latest finalized state
+      last_revision: lastFinal.revision,
+      history_seconds: 60
     }));
   });
 
@@ -97,12 +118,15 @@ function connect() {
       if (msg.active) {
         applyCaption(msg.active)
       }
+
+      retryAttempt = 0; // reset retry count on successful message
     }
   });
 
   ws.addEventListener("close", () => {
     statusEl.textContent = "disconnected";
-    // TODO: automatic reconnect after a short delay, using finalized resume state.
+    // automatic reconnect after a short delay, using finalized resume state.
+    scheduleReconnect();
   });
 
   ws.addEventListener("error", () => {
