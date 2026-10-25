@@ -49,24 +49,9 @@ finals_log: deque[Caption] #finals in segment order, then must before appending 
 active: Caption | None
 clients: dict[int, ClientState] #per-client delivery state
 
-async def broadcast_naively(raw_message: str) -> None:
-    """Send one message directly to every connected client.
-
-    This is intentionally a naive baseline. The source handler waits for all
-    sends to complete. Under pressure, this design may accumulate delay and is
-    not the target architecture for the assignment.
-    """
-    if not CLIENTS:
-        return
-
-    snapshot = list(CLIENTS)
-    results = await asyncio.gather(
-        *(client.send(raw_message) for client in snapshot),
-        return_exceptions=True,
-    )
-    for client, result in zip(snapshot, results):
-        if isinstance(result, Exception):
-            CLIENTS.discard(client)
+# One manager for the whole server lifetime, so a reconnecting source can't
+# re-send segments that clients already hold. Created on the first SOURCE_HELLO
+rsm: RevisionStateManager | None = None
 
 async def broadcast_naively(raw_message: str) -> None:
     """Send one message directly to every connected client.
@@ -86,14 +71,15 @@ async def broadcast_naively(raw_message: str) -> None:
     for client, result in zip(snapshot, results):
         if isinstance(result, Exception):
             CLIENTS.discard(client)
-
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
+    global rsm
     session = hello.get("session")
     print(f"source connected: session={session}", flush=True)
 
-    rsm = RevisionStateManager(session)
+    if rsm is None:
+        rsm = RevisionStateManager(session)
 
     try:
         async for raw in ws:
