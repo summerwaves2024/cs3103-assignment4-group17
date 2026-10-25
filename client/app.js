@@ -52,25 +52,23 @@ function applyCaption(msg) {
   }
 
   captions.set(msg.segment, msg)
-  if (msg.final && msg.segment > lastFinal.segment) {
-  lastFinal = { segment: msg.segment, revision: msg.revision };
-  }
-
-  // the general idea is 
-  // new segment -> create a new line
-  // new revision -> update the existing line
   let line = elements.get(msg.segment)
 
   if (!line) {
-    line = document.createElement('div')
-    elements.set(msg.segment, line)
-    liveEl.appendChild(line)
+    line = document.createElement("div");
+    elements.set(msg.segment, line);
+    liveEl.appendChild(line);
   }
+
   line.className = "caption-row";
   line.classList.add(msg.final ? "final-line" : "provisional-line");
-
-  line.textContent = `[${msg.final ? "FINAL" : "PROVISIONAL"}] ` +
+  line.textContent = 
+    `[${msg.final ? "FINAL" : "PROVISIONAL"}]` + 
     `segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
+ 
+  if (msg.final && msg.segment > lastFinal.segment) {
+  lastFinal = { segment: msg.segment, revision: msg.revision };
+  }
 }
 
 function scheduleReconnect() {
