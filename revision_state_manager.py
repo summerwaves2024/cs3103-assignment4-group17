@@ -15,6 +15,10 @@ class RevisionStateManager:
         # The "earliest" segment that still hasn't been finalized
         self._latest_active_seg : int = 1
 
+        # Highest segment removed by prune(). Anything at or below it has
+        # aged out of history and must not be accepted again as "new".
+        self._pruned_upto : int = 0
+
     # Updates segments if caption is accepted (e.g. revision_no not outdated)
     # out: (is_accepted, is_seg_out_of_order)
     def process_caption(self, c : Caption) -> tuple[bool, bool]:
@@ -33,6 +37,10 @@ class RevisionStateManager:
         if cap_seg_id < 1:
             return False, False
 
+        # Segment already aged out of the history window
+        if cap_seg_id <= self._pruned_upto:
+            return False, False
+
         # If this Caption is entirely new, add it to segments
         if cap_seg_id not in self._segments:
             is_out_of_order = self.add_to_segments(c, cap_seg_id)
@@ -49,6 +57,17 @@ class RevisionStateManager:
         is_out_of_order = self.add_to_segments(c, cap_seg_id)
                 
         return True, is_out_of_order
+
+    # Drops every segment <= seg_id so that _segments stays bounded.
+    # Called by the server when finals leave the history window.
+    def prune(self, seg_id : int) -> None:
+        if seg_id <= self._pruned_upto:
+            return
+        pruned_segments = [s for s in self._segments if s <= seg_id]
+        for s in pruned_segments:
+            del self._segments[s]
+        self._pruned_upto = seg_id
+        self._latest_active_seg = max(self._latest_active_seg, seg_id + 1)
 
     def get_segments(self) -> dict[int, Caption]:
         return self._segments
