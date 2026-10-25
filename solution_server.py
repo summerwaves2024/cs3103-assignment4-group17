@@ -29,7 +29,7 @@ import json
 import time
 from typing import Any
 from collections import deque
-from data_structs import Caption, ClientState, SourceHello, ClientHello
+from data_structs import Caption, ClientState, ClientStatus, SourceHello, ClientHello
 from revision_state_manager import RevisionStateManager
 
 import websockets
@@ -38,35 +38,15 @@ from websockets.asyncio.server import ServerConnection
 HISTORY_KEEP_SECONDS = 90
 MAX_HISTORY_SECONDS = 60
 DEFAULT_HISTORY_SECONDS = 30
+MAX_PENDING_FINALS = 256  # maximum for per-client backlog
 
-# Naive global set of currently connected student clients.
-# There is deliberately no per-client queue or recovery state here.
-CLIENTS: set[Any] = set()
+
 
 finals_log: deque[Caption] = deque()  # finals in segment order, trimmed to HISTORY_KEEP_SECONDS
 active: Caption | None = None          # newest draft of the current segment
-clients: dict[int, ClientState] = {}
+clients: dict[ServerConnection, ClientState] = {} # keyed by socket
 rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO
 
-
-async def broadcast_naively(raw_message: str) -> None:
-    """Send one message directly to every connected client.
-
-    This is intentionally a naive baseline. The source handler waits for all
-    sends to complete. Under pressure, this design may accumulate delay and is
-    not the target architecture for the assignment.
-    """
-    if not CLIENTS:
-        return
-
-    snapshot = list(CLIENTS)
-    results = await asyncio.gather(
-        *(client.send(raw_message) for client in snapshot),
-        return_exceptions=True,
-    )
-    for client, result in zip(snapshot, results):
-        if isinstance(result, Exception):
-            CLIENTS.discard(client)
 
 
 def parse_caption(msg: dict[str, Any]) -> Caption | None:
@@ -108,6 +88,13 @@ def trim_finals_log(now: float) -> None:
 def on_draft(caption: Caption) -> None:
     global active
     active = caption
+    for state in clients.values():
+        if state.pending_active is not None:
+            # The previous draft was never sent and is now obsolete.
+            state.drafts_dropped += 1
+            state.mode = ClientStatus.LAGGING
+        state.pending_active = caption
+        state.wake.set()
 
 
 def on_final(caption: Caption) -> None:
@@ -117,6 +104,37 @@ def on_final(caption: Caption) -> None:
 
     if active is not None and active.segment == caption.segment:
         active = None
+    for state in clients.values():
+        state.pending_finals.append(caption)
+        # The final supersedes any unsent draft of the same segment.
+        if state.pending_active is not None and state.pending_active.segment == caption.segment:
+            state.pending_active = None
+        state.wake.set()
+
+
+async def client_sender(state: ClientState) -> None:
+    """Per-client sender: every final in order, then only the newest draft.
+
+    This is the only place that awaits ws.send for this client, so a slow
+    client never blocks the source or the other clients.
+    """
+    try:
+        while True:
+            await state.wake.wait()
+            state.wake.clear()
+            while state.pending_finals or state.pending_active is not None:
+                # send unsent finals first (from oldest to newest)
+                if state.pending_finals:
+                    caption = state.pending_finals.popleft()
+                    state.last_final = (caption.segment, caption.revision)
+                # if no more finals left to send, send the actively changing one
+                else:
+                    caption = state.pending_active
+                    state.pending_active = None
+                await state.ws.send(json.dumps(caption_to_dict(caption)))
+            state.mode = ClientStatus.NORMAL
+    except websockets.ConnectionClosed:
+        pass  # handle_client's finally does the cleanup
 
 
 async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
@@ -149,7 +167,6 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
                     on_final(caption)
                 else:
                     on_draft(caption)
-                await broadcast_naively(json.dumps(caption_to_dict(caption)))
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
@@ -175,6 +192,7 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
 
     try:
         last_segment = max(0, int(hello.get("last_segment") or 0))
+        last_revision = int(hello.get("last_revision") or 0)
         history_seconds = float(hello.get("history_seconds", DEFAULT_HISTORY_SECONDS))
     except (TypeError, ValueError):
         await ws.close(code=1008, reason="Invalid CLIENT_HELLO fields")
@@ -185,13 +203,19 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         history_seconds = MAX_HISTORY_SECONDS
 
     items = history_items(last_segment, history_seconds, time.time())
-    CLIENTS.add(ws)
+    pending = active if active is not None and active.segment > last_segment else None
+    state = ClientState(ws=ws, pending_finals=deque(maxlen=MAX_PENDING_FINALS),
+                        pending_active=pending, last_final=(last_segment, last_revision))
+    clients[ws] = state
     print(f"client connected: id={client_id}; last_segment={last_segment}; "
-          f"history={len(items)}; clients={len(CLIENTS)}", flush=True)
+          f"history={len(items)}; clients={len(clients)}", flush=True)
 
     try:
         await ws.send(json.dumps({"type": "HISTORY",
                                   "items": [caption_to_dict(c) for c in items]}))
+        # The current draft (if any) follows as a normal CAPTION_UPDATE.
+        state.sender = asyncio.create_task(client_sender(state))
+        state.wake.set()
         # Student clients normally don't send further messages after hello.
         # Keep the WebSocket open until the client disconnects.
         async for _ in ws:
@@ -199,8 +223,11 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
     except websockets.ConnectionClosed:
         pass
     finally:
-        CLIENTS.discard(ws)
-        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+        clients.pop(ws, None)
+        if state.sender is not None:
+            state.sender.cancel()
+        print(f"client disconnected: id={client_id}; drafts_dropped={state.drafts_dropped}; "
+              f"clients={len(clients)}", flush=True)
 
 
 async def handler(ws) -> None:

@@ -1,6 +1,6 @@
 import asyncio
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal, NotRequired, TypedDict
 
@@ -48,8 +48,9 @@ class ClientState:
   ws : object # WebSocket Object
   pending_finals : deque[Caption]
   pending_active : Caption | None
-  mode : ClientStatus # True -> “normal” or False -> “lagging”
   last_final : tuple[int, int]  # (segment, revision)
-  wake : asyncio.Event # tell the sender task there is work to do 
-                       # so we can individually send rather than broadcast
-  sender: asyncio.Task 
+  mode : ClientStatus = ClientStatus.NORMAL
+  wake : asyncio.Event = field(default_factory=asyncio.Event) # tell the sender task there is work to do
+                                                              # so we can individually send rather than broadcast
+  sender : asyncio.Task | None = None
+  drafts_dropped : int = 0 # drafts overwritten before they could be sent
