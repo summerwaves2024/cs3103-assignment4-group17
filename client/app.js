@@ -63,11 +63,11 @@ function applyCaption(msg) {
   line.className = "caption-row";
   line.classList.add(msg.final ? "final-line" : "provisional-line");
   line.textContent = 
-    `[${msg.final ? "FINAL" : "PROVISIONAL"}]` + 
+    `[${msg.final ? "FINAL" : "PROVISIONAL"}]` +
     `segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
  
   if (msg.final && msg.segment > lastFinal.segment) {
-  lastFinal = { segment: msg.segment, revision: msg.revision };
+    lastFinal = { segment: msg.segment, revision: msg.revision };
   }
 }
 
@@ -96,7 +96,7 @@ function connect() {
       type: "CLIENT_HELLO",
       client_id: numericClientId(),
       session: "L1",
-      last_segment: lastFinal.segment,       // TODO: resume latest finalized state
+      last_segment: lastFinal.segment,
       last_revision: lastFinal.revision,
       history_seconds: 60
     }));
