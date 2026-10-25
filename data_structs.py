@@ -19,7 +19,7 @@ class Caption:
     text : str
 
     @classmethod
-    def from_dict(cls, caption_dict : dict) -> void:
+    def from_dict(cls, caption_dict : dict) -> "Caption":
         session = caption_dict.get("session")
         segment = caption_dict.get("segment")
         revision = caption_dict.get("revision")

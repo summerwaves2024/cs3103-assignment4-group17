@@ -8,7 +8,7 @@
 from data_structs import Caption
 
 class RevisionStateManager:
-    def __init__(self, session : int):
+    def __init__(self, session : str):
         self._session = session
         self._segments: dict[int, Caption] = {}
 
@@ -18,6 +18,10 @@ class RevisionStateManager:
     # Updates segments if caption is accepted (e.g. revision_no not outdated)
     # out: (is_accepted, is_seg_out_of_order)
     def process_caption(self, c : Caption) -> tuple[bool, bool]:
+
+        # Reject malformed captions (missing / wrongly typed fields)
+        if not isinstance(c.segment, int) or not isinstance(c.revision, int):
+            return False, False
 
         # Reject if wrong session
         if c.session != self._session:
