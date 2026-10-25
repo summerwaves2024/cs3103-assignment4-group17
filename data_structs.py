@@ -18,6 +18,17 @@ class Caption:
     final : bool
     text : str
 
+    @classmethod
+    def from_dict(cls, caption_dict : dict) -> "Caption":
+        session = caption_dict.get("session")
+        segment = caption_dict.get("segment")
+        revision = caption_dict.get("revision")
+        source_ts = caption_dict.get("source_ts")
+        final = caption_dict.get("final")
+        text = caption_dict.get("text")
+        return cls(session, segment, revision,
+                   source_ts, final, text)
+
 
 @dataclass
 class ClientState:

@@ -43,11 +43,15 @@ import websockets
 # There is deliberately no per-client queue or recovery state here.
 CLIENTS: set[Any] = set()
 
-finals_log: deque[Caption] #finals in segment order, then must before appending a new 
+finals_log: deque[Caption] = deque() #finals in segment order, then must before appending a new 
                            # final, pop left updates that is past the 90s
                            
-active: Caption | None
-clients: dict[int, ClientState] #per-client delivery state
+active: Caption | None = None
+clients: dict[int, ClientState] = {} #per-client delivery state
+
+# One manager for the whole server lifetime, so a reconnecting source can't
+# re-send segments that clients already hold. Created on the first SOURCE_HELLO
+rsm: RevisionStateManager | None = None
 
 async def broadcast_naively(raw_message: str) -> None:
     """Send one message directly to every connected client.
@@ -70,8 +74,12 @@ async def broadcast_naively(raw_message: str) -> None:
 
 
 async def handle_source(ws, hello: dict[str, Any]) -> None:
+    global rsm
     session = hello.get("session")
     print(f"source connected: session={session}", flush=True)
+
+    if rsm is None:
+        rsm = RevisionStateManager(session)
 
     try:
         async for raw in ws:
@@ -84,7 +92,10 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
             if msg_type == "CAPTION_UPDATE":
                 # Baseline behavior: forward exactly what was received.
                 # No history, state, validation, coalescing, or bounded queues.
-                await broadcast_naively(raw)
+                caption : Caption = Caption.from_dict(msg)
+                is_accepted, is_out_of_order = rsm.process_caption(caption)
+                if is_accepted:
+                    await broadcast_naively(raw)
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
