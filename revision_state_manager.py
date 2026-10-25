@@ -56,15 +56,6 @@ class RevisionStateManager:
     def get_segment(self, segment_id : int) -> Caption | None:
         return self._segments.get(segment_id)
 
-    def update_caption(self, c : Caption) -> Caption:
-        cap_seg_id : int = c.segment
-
-        if cap_seg_id in self._segments:
-            latest_caption : Caption = self._segments[cap_seg_id]
-            assert(latest_caption.revision >= c.revision)
-
-            return latest_caption
-
     def add_to_segments(self, c : Caption, seg_id : int) -> bool:
         self._segments[seg_id] = c
 

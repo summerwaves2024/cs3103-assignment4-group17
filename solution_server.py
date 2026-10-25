@@ -43,11 +43,11 @@ import websockets
 # There is deliberately no per-client queue or recovery state here.
 CLIENTS: set[Any] = set()
 
-finals_log: deque[Caption] #finals in segment order, then must before appending a new 
+finals_log: deque[Caption] = deque() #finals in segment order, then must before appending a new 
                            # final, pop left updates that is past the 90s
                            
-active: Caption | None
-clients: dict[int, ClientState] #per-client delivery state
+active: Caption | None = None
+clients: dict[int, ClientState] = {} #per-client delivery state
 
 # One manager for the whole server lifetime, so a reconnecting source can't
 # re-send segments that clients already hold. Created on the first SOURCE_HELLO
