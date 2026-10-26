@@ -20,12 +20,18 @@ const WS_URL = "ws://127.0.0.1:8765";
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
 const recallEl = document.getElementById("recall");
+const recallEmptyEl = document.getElementById("recall-empty");
+const recallPanel = document.getElementById("recall-panel");
+const recallOpenButton = document.getElementById("recall-open");
+const recallWindowButtons = document.querySelectorAll("button[data-seconds]");
 
 let ws;
 let lastFinal = { segment: 0, revision: 0 };
 let retryAttempt = 0;
 let retryTimer = null;
 let recallSeconds = 30;
+let recallFollow = true; // keep the recall list at the newest caption
+const recallRows = new Map(); // segment -> row in the recall list
 const captions = new Map(); // segment -> latest caption
 const elements = new Map(); // segment -> DOM element
 
@@ -39,27 +45,73 @@ function numericClientId() {
   return Number(value);
 }
 
+function captionTime(caption) {
+  return new Date(caption.source_ts * 1000).toLocaleTimeString([], {
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  });
+}
+
+function fillCaptionRow(row, caption) {
+  row.className = "caption-row " + (caption.final ? "final-line" : "provisional-line");
+  const time = document.createElement("span");
+  time.className = "caption-time";
+  time.textContent = caption.final ? captionTime(caption) : "now";
+  const text = document.createElement("span");
+  text.className = "caption-text";
+  text.textContent = caption.text;
+  row.replaceChildren(time, text);
+}
+
 function renderRecall() {
+  if (recallPanel.hidden) return;
   const cutoff = Date.now() / 1000 - recallSeconds;
 
   const items = [...captions.values()]
     .filter(c => c.final && c.source_ts >= cutoff)
-    .sort((a, b) => a.source_ts - b.source_ts);
+    .sort((a, b) => a.segment - b.segment);
+  const inWindow = new Set(items.map(c => c.segment));
 
-  recallEl.replaceChildren();
-
-  if (items.length === 0) {
-    recallEl.textContent =
-      `No captions in the last ${recallSeconds} seconds.`;
-    return;
+  // Update the list in place instead of rebuilding
+  // so a user who scrolled up keeps their place. 
+  //
+  // For rows that left the window, remove them and
+  // scroll up by their height so the text being read
+  // does not move
+  let removedHeight = 0;
+  for (const [segment, row] of recallRows) {
+    if (!inWindow.has(segment)) {
+      removedHeight += row.offsetHeight;
+      row.remove();
+      recallRows.delete(segment);
+    }
+  }
+  if (!recallFollow) {
+    recallEl.scrollTop -= removedHeight;
   }
 
+  // Add new captions, in segment order.
   for (const caption of items) {
+    if (recallRows.has(caption.segment)) continue;
     const row = document.createElement("div");
-    row.textContent = caption.text;
-    recallEl.appendChild(row);
+    fillCaptionRow(row, caption);
+    const next = [...recallRows].find(([segment]) => segment > caption.segment);
+    recallEl.insertBefore(row, next ? next[1] : null);
+    recallRows.set(caption.segment, row);
+  }
+
+  recallEmptyEl.hidden = items.length > 0;
+  recallEmptyEl.textContent = `No captions in the last ${recallSeconds} seconds.`;
+
+  if (recallFollow) {
+    recallEl.scrollTop = recallEl.scrollHeight;
   }
 }
+
+// Follow the newest caption while the user is at the bottom. Then stop as soon as
+// they scroll up to read, and resume when they scroll back down.
+recallEl.addEventListener("scroll", () => {
+  recallFollow = recallEl.scrollHeight - recallEl.scrollTop - recallEl.clientHeight < 8;
+});
 
 function applyCaption(msg) {
   const existingCaption = captions.get(msg.segment)
@@ -86,11 +138,7 @@ function applyCaption(msg) {
     liveEl.appendChild(line);
   }
 
-  line.className = "caption-row";
-  line.classList.add(msg.final ? "final-line" : "provisional-line");
-  line.textContent = 
-    `[${msg.final ? "FINAL" : "PROVISIONAL"}]` + 
-    `segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
+  fillCaptionRow(line, msg);
  
   if (msg.final && msg.segment > lastFinal.segment) {
   lastFinal = { segment: msg.segment, revision: msg.revision };
@@ -161,15 +209,41 @@ function connect() {
   });
 }
 
-for (const button of document.querySelectorAll("button[data-seconds]")) {
-  button.addEventListener("click", () => {
-    recallSeconds = Number(button.dataset.seconds);
-    renderRecall();
-  });
+function setRecallWindow(seconds) {
+  recallSeconds = seconds;
+  recallFollow = true;
+  for (const button of recallWindowButtons) {
+    button.setAttribute("aria-pressed", String(Number(button.dataset.seconds) === seconds));
+  }
+  renderRecall();
 }
 
-// show the default 30-second view
-renderRecall();
-// update the recall view every second
+// "What did I miss?" opens on demand and always starts at the 30-second view
+function openRecall() {
+  recallPanel.hidden = false;
+  recallOpenButton.setAttribute("aria-expanded", "true");
+  setRecallWindow(30);
+}
+
+function closeRecall() {
+  recallPanel.hidden = true;
+  recallOpenButton.setAttribute("aria-expanded", "false");
+}
+
+recallOpenButton.addEventListener("click", () => {
+  if (recallPanel.hidden) {
+    openRecall();
+  } else {
+    closeRecall();
+  }
+});
+document.getElementById("recall-close").addEventListener("click", closeRecall);
+
+for (const button of recallWindowButtons) {
+  button.addEventListener("click", () => setRecallWindow(Number(button.dataset.seconds)));
+}
+
+// keep the recall view current while it is open
 setInterval(renderRecall, 1000);
+
 connect();
