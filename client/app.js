@@ -72,13 +72,12 @@ function applyCaption(msg) {
     if (msg.revision <= existingCaption.revision) {
       return
     }
-
-    if (msg.final) {
-      renderRecall()
-    }
   }
 
   captions.set(msg.segment, msg)
+  if (msg.final) {
+      renderRecall()
+    }
   let line = elements.get(msg.segment)
 
   if (!line) {
