@@ -34,6 +34,7 @@ let recallFollow = true; // keep the recall list at the newest caption
 const recallRows = new Map(); // segment -> row in the recall list
 const captions = new Map(); // segment -> latest caption
 const elements = new Map(); // segment -> DOM element
+const KEEP_SECONDS = 90; // messages beyond KEEP_SECONDS ago are no longer stored in device
 
 function numericClientId() {
   const key = "liverecall-client-id";
@@ -243,7 +244,21 @@ for (const button of recallWindowButtons) {
   button.addEventListener("click", () => setRecallWindow(Number(button.dataset.seconds)));
 }
 
-// keep the recall view current while it is open
-setInterval(renderRecall, 1000);
+function pruneOldCaptions() {
+  const cutoff = Date.now() / 1000 - KEEP_SECONDS;
+  for (const [segment, caption] of captions) {
+    if (caption.source_ts < cutoff) {
+      captions.delete(segment);
+      elements.get(segment)?.remove();
+      elements.delete(segment);
+    }
+  }
+}
+
+// every second: drop old captions, and keep the recall view current while it is open
+setInterval(() => {
+  pruneOldCaptions();
+  renderRecall();
+}, 1000);
 
 connect();
