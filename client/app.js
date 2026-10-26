@@ -21,19 +21,25 @@ const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
 const recallEl = document.getElementById("recall");
 const recallEmptyEl = document.getElementById("recall-empty");
+const noticeEl = document.getElementById("notice");
 const recallPanel = document.getElementById("recall-panel");
 const recallOpenButton = document.getElementById("recall-open");
 const recallWindowButtons = document.querySelectorAll("button[data-seconds]");
+const recallLatestButton = document.getElementById("recall-latest");
+
 
 let ws;
 let lastFinal = { segment: 0, revision: 0 };
 let retryAttempt = 0;
 let retryTimer = null;
+let resumeFrom = 0; // last final segment this connection resumed from (0 = fresh join)
+let noticeTimer = null;
 let recallSeconds = 30;
-let recallFollow = true; // keep the recall list at the newest caption
+let recallFollow = false; // whether recall follows newly arriving captions
 const recallRows = new Map(); // segment -> row in the recall list
 const captions = new Map(); // segment -> latest caption
 const elements = new Map(); // segment -> DOM element
+let latestLiveElement = null;
 const KEEP_SECONDS = 90; // messages beyond KEEP_SECONDS ago are no longer stored in device
 
 function numericClientId() {
@@ -89,6 +95,7 @@ function renderRecall() {
   if (!recallFollow) {
     recallEl.scrollTop -= removedHeight;
   }
+  recallLatestButton.hidden = recallFollow;
 
   // Add new captions, in segment order.
   for (const caption of items) {
@@ -111,19 +118,32 @@ function renderRecall() {
 // Follow the newest caption while the user is at the bottom. Then stop as soon as
 // they scroll up to read, and resume when they scroll back down.
 recallEl.addEventListener("scroll", () => {
-  recallFollow = recallEl.scrollHeight - recallEl.scrollTop - recallEl.clientHeight < 8;
+  recallFollow =
+    recallEl.scrollHeight - recallEl.scrollTop - recallEl.clientHeight < 8;
+
+  recallLatestButton.hidden = recallFollow;
 });
 
+recallLatestButton.addEventListener("click", () => {
+  recallFollow = true;
+  recallEl.scrollTo({
+    top: recallEl.scrollHeight,
+    behavior: "smooth",
+  });
+  recallLatestButton.hidden = true;
+});
+
+// Returns true if the caption was applied, false if it was stale or a duplicate.
 function applyCaption(msg) {
   const existingCaption = captions.get(msg.segment)
   
   // updating the caption
   if (existingCaption) {
     if (existingCaption.final) {
-      return
+      return false
     }
     if (msg.revision <= existingCaption.revision) {
-      return
+      return false
     }
   }
 
@@ -139,11 +159,25 @@ function applyCaption(msg) {
     liveEl.appendChild(line);
   }
 
+  latestLiveElement?.classList.remove("latest-line");
+  line.classList.add("latest-line");
+  latestLiveElement = line;
+  line.dataset.segment = String(msg.segment);
+
+
   fillCaptionRow(line, msg);
  
   if (msg.final && msg.segment > lastFinal.segment) {
   lastFinal = { segment: msg.segment, revision: msg.revision };
   }
+  return true
+}
+
+function showNotice(text) {
+  noticeEl.textContent = text;
+  noticeEl.hidden = false;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => { noticeEl.hidden = true; }, 6000);
 }
 
 function scheduleReconnect() {
@@ -154,7 +188,7 @@ function scheduleReconnect() {
   // together don't all reconnect at the same moment
   const cap = Math.min(10000, 500 * 2 ** retryAttempt++);
   const delay = cap / 2 + Math.random() * (cap / 2);
-  statusEl.textContent = `reconnecting in ${(delay / 1000).toFixed(1)} s`;
+  statusEl.textContent = `Reconnecting in ${(delay / 1000).toFixed(1)} s (attempt ${retryAttempt})`;
 
   retryTimer = setTimeout(() => {
     retryTimer = null;
@@ -164,12 +198,13 @@ function scheduleReconnect() {
 
 function connect() {
   statusEl.textContent = 
-  lastFinal.segment === 0 ? "connecting..." : "reconnecting...";
+  lastFinal.segment === 0 ? "Connecting…" : "Reconnecting…";
 
   ws = new WebSocket(WS_URL);
 
   ws.addEventListener("open", () => {
-    statusEl.textContent = "connected";
+    statusEl.textContent = "Live";
+    resumeFrom = lastFinal.segment;
     ws.send(JSON.stringify({
       type: "CLIENT_HELLO",
       client_id: numericClientId(),
@@ -187,8 +222,19 @@ function connect() {
     } else if (msg.type === "HISTORY") {
       console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
       // merge history without stale/duplicate final captions.
+      let recovered = 0;
       for (const item of msg.items ?? []) {
-        applyCaption(item)
+        if (applyCaption(item) && item.final) recovered++;
+      }
+
+      // Tell the user what recovery did.
+      const s = recovered === 1 ? "" : "s";
+      if (resumeFrom > 0) {
+        showNotice(recovered > 0
+          ? `Reconnected: recovered ${recovered} missed caption${s}, no duplicates.`
+          : "Reconnected. Nothing was missed.");
+      } else if (recovered > 0) {
+        showNotice(`Joined mid-lecture: loaded ${recovered} earlier caption${s}.`);
       }
 
       if (msg.active) {
@@ -200,13 +246,13 @@ function connect() {
   });
 
   ws.addEventListener("close", () => {
-    statusEl.textContent = "disconnected";
+    statusEl.textContent = "Connection lost";
     // automatic reconnect after a short delay, using finalized resume state.
     scheduleReconnect();
   });
 
   ws.addEventListener("error", () => {
-    statusEl.textContent = "connection error";
+    statusEl.textContent = "Connection lost";
   });
 }
 
