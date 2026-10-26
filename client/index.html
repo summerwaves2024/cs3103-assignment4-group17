@@ -91,6 +91,14 @@
       font-size: 1rem;
     }
 
+    .notice {
+      flex: 0 0 auto;
+      padding: 0.5rem 1.25rem;
+      background: #ddf3e8;
+      color: #0b4a2e;
+      font-size: 0.9rem;
+    }
+
     .panel-footer {
       flex: 0 0 auto;
       display: flex;
@@ -233,6 +241,7 @@
         <div class="panel-header">
           <h2>Live captions</h2>
         </div>
+        <div id="notice" class="notice" role="status" hidden></div>
         <div class="live-viewport">
           <div id="live" aria-live="polite"></div>
         </div>
