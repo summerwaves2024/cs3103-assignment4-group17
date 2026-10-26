@@ -26,58 +26,124 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import time
 from typing import Any
 from collections import deque
-from data_structs import Caption, ClientState, ClientStatus
+from data_structs import Caption, ClientState, ClientStatus, SourceHello, ClientHello
 from revision_state_manager import RevisionStateManager
 
-# Uncomment if needed, delete if no need
-# @dataclass
-# class Update:
-#   caption : Caption
-#   data : bytes   #encoded in json
-
 import websockets
+from websockets.asyncio.server import ServerConnection
 
-# Naive global set of currently connected student clients.
-# There is deliberately no per-client queue or recovery state here.
-CLIENTS: set[Any] = set()
+HISTORY_KEEP_SECONDS = 90
+MAX_HISTORY_SECONDS = 60
+DEFAULT_HISTORY_SECONDS = 30
+MAX_PENDING_FINALS = 256  # maximum for per-client backlog
 
-finals_log: deque[Caption] = deque() #finals in segment order, then must before appending a new 
-                           # final, pop left updates that is past the 90s
-                           
-active: Caption | None = None
-clients: dict[int, ClientState] = {} #per-client delivery state
 
-# One manager for the whole server lifetime, so a reconnecting source can't
-# re-send segments that clients already hold. Created on the first SOURCE_HELLO
-rsm: RevisionStateManager | None = None
 
-async def broadcast_naively(raw_message: str) -> None:
-    """Send one message directly to every connected client.
+finals_log: deque[Caption] = deque()  # finals in segment order, trimmed to HISTORY_KEEP_SECONDS
+active: Caption | None = None          # newest draft of the current segment
+clients: dict[ServerConnection, ClientState] = {} # keyed by socket
+rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO
 
-    This is intentionally a naive baseline. The source handler waits for all
-    sends to complete. Under pressure, this design may accumulate delay and is
-    not the target architecture for the assignment.
+
+
+def parse_caption(msg: dict[str, Any]) -> Caption | None:
+    try:
+        caption = Caption.from_dict(msg)
+        caption.segment = int(caption.segment)
+        caption.revision = int(caption.revision)
+        caption.source_ts = float(caption.source_ts)
+    except (TypeError, ValueError):
+        return None
+    if caption.revision < 1 or not isinstance(caption.text, str):
+        return None
+    caption.final = bool(caption.final)
+    return caption
+
+
+def caption_to_dict(caption: Caption) -> dict[str, Any]:
+    """only forward the necessary fields"""
+    return {
+        "type": "CAPTION_UPDATE",
+        "session": caption.session,
+        "segment": caption.segment,
+        "revision": caption.revision,
+        "source_ts": caption.source_ts,
+        "final": caption.final,
+        "text": caption.text,
+    }
+
+
+def trim_finals_log(now: float) -> None:
+    """Drop finals older than the history window, and their segment state"""
+    pruned_seg = 0
+    while finals_log and finals_log[0].source_ts < now - HISTORY_KEEP_SECONDS:
+        pruned_seg = max(pruned_seg, finals_log.popleft().segment)
+    if pruned_seg:
+        rsm.prune(pruned_seg)
+
+
+def on_draft(caption: Caption) -> None:
+    global active
+    active = caption
+    for state in clients.values():
+        if state.pending_active is not None:
+            # The previous draft was never sent and is now obsolete.
+            state.drafts_dropped += 1
+            state.mode = ClientStatus.LAGGING
+        state.pending_active = caption
+        state.wake.set()
+
+
+def on_final(caption: Caption) -> None:
+    global active
+    trim_finals_log(caption.source_ts)
+    finals_log.append(caption)
+
+    if active is not None and active.segment == caption.segment:
+        active = None
+    for state in clients.values():
+        state.pending_finals.append(caption)
+        # The final supersedes any unsent draft of the same segment.
+        if state.pending_active is not None and state.pending_active.segment == caption.segment:
+            state.pending_active = None
+        state.wake.set()
+
+
+async def client_sender(state: ClientState) -> None:
+    """Per-client sender: every final in order, then only the newest draft.
+
+    This is the only place that awaits ws.send for this client, so a slow
+    client never blocks the source or the other clients.
     """
-    if not CLIENTS:
-        return
+    try:
+        while True:
+            await state.wake.wait()
+            state.wake.clear()
+            while state.pending_finals or state.pending_active is not None:
+                # send unsent finals first (from oldest to newest)
+                if state.pending_finals:
+                    caption = state.pending_finals.popleft()
+                    state.last_final = (caption.segment, caption.revision)
+                # if no more finals left to send, send the actively changing one
+                else:
+                    caption = state.pending_active
+                    state.pending_active = None
+                await state.ws.send(json.dumps(caption_to_dict(caption)))
+            state.mode = ClientStatus.NORMAL
+    except websockets.ConnectionClosed:
+        pass  # handle_client's finally does the cleanup
 
-    snapshot = list(CLIENTS)
-    results = await asyncio.gather(
-        *(client.send(raw_message) for client in snapshot),
-        return_exceptions=True,
-    )
-    for client, result in zip(snapshot, results):
-        if isinstance(result, Exception):
-            CLIENTS.discard(client)
 
-
-async def handle_source(ws, hello: dict[str, Any]) -> None:
+async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
     global rsm
     session = hello.get("session")
     print(f"source connected: session={session}", flush=True)
 
+    # One manager for the lifetime of the server, so a reconnecting source
+    # can't re-send segments that clients already hold.
     if rsm is None:
         rsm = RevisionStateManager(session)
 
@@ -90,12 +156,17 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
 
             msg_type = msg.get("type")
             if msg_type == "CAPTION_UPDATE":
-                # Baseline behavior: forward exactly what was received.
-                # No history, state, validation, coalescing, or bounded queues.
-                caption : Caption = Caption.from_dict(msg)
-                is_accepted, is_out_of_order = rsm.process_caption(caption)
-                if is_accepted:
-                    await broadcast_naively(raw)
+                caption = parse_caption(msg)
+                if caption is None:
+                    print(f"dropped malformed update: {raw!r:.120}", flush=True)
+                    continue
+                is_accepted, _ = rsm.process_caption(caption)
+                if not is_accepted:
+                    continue
+                if caption.final:
+                    on_final(caption)
+                else:
+                    on_draft(caption)
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
@@ -104,39 +175,70 @@ async def handle_source(ws, hello: dict[str, Any]) -> None:
                 # Forward compatibility: ignore fields/messages this baseline
                 # doesn't understand rather than crashing.
                 continue
+    except websockets.ConnectionClosed:
+        pass  # abrupt source drop: clients keep being served from history
     finally:
         print("source disconnected", flush=True)
 
 
-async def handle_client(ws, hello: dict[str, Any]) -> None:
+def history_items(last_segment: int, history_seconds: float, now: float) -> list[Caption]:
+    cutoff = now - history_seconds
+    return [c for c in finals_log
+            if c.segment > last_segment and c.source_ts >= cutoff]
+
+
+async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
     client_id = hello.get("client_id")
 
-    # The baseline has no stored recovery state. Sending an empty HISTORY makes
-    # the connection behavior visible and keeps the starter easy to inspect.
-    # Students must implement correct HISTORY semantics for the assignment.
-    await ws.send(json.dumps({"type": "HISTORY", "items": []}))
-
-    CLIENTS.add(ws)
-    print(f"client connected: id={client_id}; clients={len(CLIENTS)}", flush=True)
     try:
+        last_segment = max(0, int(hello.get("last_segment") or 0))
+        last_revision = int(hello.get("last_revision") or 0)
+        history_seconds = float(hello.get("history_seconds", DEFAULT_HISTORY_SECONDS))
+    except (TypeError, ValueError):
+        await ws.close(code=1008, reason="Invalid CLIENT_HELLO fields")
+        return
+    history_seconds = min(max(history_seconds, 0), MAX_HISTORY_SECONDS)
+    if last_segment > 0:
+        # Resuming client: recover every final it missed (capped at 60 s),
+        history_seconds = MAX_HISTORY_SECONDS
+
+    items = history_items(last_segment, history_seconds, time.time())
+    pending = active if active is not None and active.segment > last_segment else None
+    state = ClientState(ws=ws, pending_finals=deque(maxlen=MAX_PENDING_FINALS),
+                        pending_active=pending, last_final=(last_segment, last_revision))
+    clients[ws] = state
+    print(f"client connected: id={client_id}; last_segment={last_segment}; "
+          f"history={len(items)}; clients={len(clients)}", flush=True)
+
+    try:
+        await ws.send(json.dumps({"type": "HISTORY",
+                                  "items": [caption_to_dict(c) for c in items]}))
+        # The current draft (if any) follows as a normal CAPTION_UPDATE.
+        state.sender = asyncio.create_task(client_sender(state))
+        state.wake.set()
         # Student clients normally don't send further messages after hello.
         # Keep the WebSocket open until the client disconnects.
         async for _ in ws:
             pass
+    except websockets.ConnectionClosed:
+        pass
     finally:
-        CLIENTS.discard(ws)
-        print(f"client disconnected: id={client_id}; clients={len(CLIENTS)}", flush=True)
+        clients.pop(ws, None)
+        if state.sender is not None:
+            state.sender.cancel()
+        print(f"client disconnected: id={client_id}; drafts_dropped={state.drafts_dropped}; "
+              f"clients={len(clients)}", flush=True)
 
 
 async def handler(ws) -> None:
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=5)
         hello = json.loads(raw)
-    except (asyncio.TimeoutError, json.JSONDecodeError):
+    except (asyncio.TimeoutError, json.JSONDecodeError, websockets.ConnectionClosed):
         await ws.close(code=1008, reason="Expected a valid hello message")
         return
 
-    msg_type = hello.get("type")
+    msg_type = hello.get("type") if isinstance(hello, dict) else None
     if msg_type == "SOURCE_HELLO":
         await handle_source(ws, hello)
     elif msg_type == "CLIENT_HELLO":
