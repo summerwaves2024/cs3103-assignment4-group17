@@ -25,6 +25,7 @@ let ws;
 let lastFinal = { segment: 0, revision: 0 };
 let retryAttempt = 0;
 let retryTimer = null;
+let recallSeconds = 30;
 const captions = new Map(); // segment -> latest caption
 const elements = new Map(); // segment -> DOM element
 
@@ -38,6 +39,28 @@ function numericClientId() {
   return Number(value);
 }
 
+function renderRecall() {
+  const cutoff = Date.now() / 1000 - recallSeconds;
+
+  const items = [...captions.values()]
+    .filter(c => c.final && c.source_ts >= cutoff)
+    .sort((a, b) => a.segment - b.segment);
+
+  recallEl.replaceChildren();
+
+  if (items.length === 0) {
+    recallEl.textContent =
+      `No captions in the last ${recallSeconds} seconds.`;
+    return;
+  }
+
+  for (const caption of items) {
+    const row = document.createElement("div");
+    row.textContent = caption.text;
+    recallEl.appendChild(row);
+  }
+}
+
 function applyCaption(msg) {
   const existingCaption = captions.get(msg.segment)
   
@@ -48,6 +71,10 @@ function applyCaption(msg) {
     }
     if (msg.revision <= existingCaption.revision) {
       return
+    }
+
+    if (msg.final) {
+      renderRecall()
     }
   }
 
@@ -137,9 +164,14 @@ function connect() {
 
 for (const button of document.querySelectorAll("button[data-seconds]")) {
   button.addEventListener("click", () => {
-    const seconds = Number(button.dataset.seconds);
-    recallEl.textContent = `TODO: show finalized captions from the previous ${seconds} seconds using local state.`;
+    recallSeconds = Number(button.dataset.seconds);
+    renderRecall();
   });
 }
+
+// show the default 30-second view
+renderRecall();
+// update the recall view every second
+setInterval(renderRecall, 1000);
 
 connect();
