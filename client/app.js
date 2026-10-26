@@ -44,7 +44,7 @@ function renderRecall() {
 
   const items = [...captions.values()]
     .filter(c => c.final && c.source_ts >= cutoff)
-    .sort((a, b) => a.segment - b.segment);
+    .sort((a, b) => a.source_ts - b.source_ts);
 
   recallEl.replaceChildren();
 
@@ -125,7 +125,7 @@ function connect() {
       type: "CLIENT_HELLO",
       client_id: numericClientId(),
       session: "L1",
-      last_segment: lastFinal.segment,       // TODO: resume latest finalized state
+      last_segment: lastFinal.segment,
       last_revision: lastFinal.revision,
       history_seconds: 60
     }));
@@ -172,5 +172,4 @@ for (const button of document.querySelectorAll("button[data-seconds]")) {
 renderRecall();
 // update the recall view every second
 setInterval(renderRecall, 1000);
-
 connect();
