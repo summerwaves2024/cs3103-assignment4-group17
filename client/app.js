@@ -23,6 +23,8 @@ const recallEl = document.getElementById("recall");
 const recallEmptyEl = document.getElementById("recall-empty");
 const noticeEl = document.getElementById("notice");
 const recallPanel = document.getElementById("recall-panel");
+const appMainEl = document.querySelector(".app-main");
+const dividerEl = document.getElementById("divider");
 const recallOpenButton = document.getElementById("recall-open");
 const recallWindowButtons = document.querySelectorAll("button[data-seconds]");
 
@@ -246,12 +248,14 @@ function setRecallWindow(seconds) {
 // "What did I miss?" opens on demand and always starts at the 30-second view
 function openRecall() {
   recallPanel.hidden = false;
+  dividerEl.hidden = false;
   recallOpenButton.setAttribute("aria-expanded", "true");
   setRecallWindow(30);
 }
 
 function closeRecall() {
   recallPanel.hidden = true;
+  dividerEl.hidden = true;
   recallOpenButton.setAttribute("aria-expanded", "false");
 }
 
@@ -267,6 +271,40 @@ document.getElementById("recall-close").addEventListener("click", closeRecall);
 for (const button of recallWindowButtons) {
   button.addEventListener("click", () => setRecallWindow(Number(button.dataset.seconds)));
 }
+
+// Resizing the recall panel by dragging the divider.
+// The width is kept between visits (width stored in local storage) and the live captions take the rest.
+const RECALL_MIN_WIDTH = 260;
+const RECALL_WIDTH_KEY = "liverecall-recall-width";
+
+function setRecallWidth(px) {
+  const width = Math.round(Math.min(Math.max(px, RECALL_MIN_WIDTH), appMainEl.clientWidth * 0.6));
+  appMainEl.style.setProperty("--recall-width", `${width}px`);
+  try { localStorage.setItem(RECALL_WIDTH_KEY, String(width)); } catch {}
+}
+
+dividerEl.addEventListener("pointerdown", (event) => {
+  const startX = event.clientX;
+  const startWidth = recallPanel.getBoundingClientRect().width;
+  dividerEl.setPointerCapture(event.pointerId);
+  document.body.classList.add("resizing");
+
+  // The recall panel is on the right, so dragging left makes it wider.
+  const onMove = (e) => setRecallWidth(startWidth + startX - e.clientX);
+  const onEnd = () => {
+    dividerEl.removeEventListener("pointermove", onMove);
+    dividerEl.removeEventListener("lostpointercapture", onEnd);
+    document.body.classList.remove("resizing");
+  };
+  dividerEl.addEventListener("pointermove", onMove);
+  dividerEl.addEventListener("lostpointercapture", onEnd);
+  event.preventDefault();
+});
+
+try {
+  const saved = Number(localStorage.getItem(RECALL_WIDTH_KEY));
+  if (saved > 0) appMainEl.style.setProperty("--recall-width", `${saved}px`);
+} catch {}
 
 function pruneOldCaptions() {
   const cutoff = Date.now() / 1000 - KEEP_SECONDS;
