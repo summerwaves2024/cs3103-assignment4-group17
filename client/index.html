@@ -106,25 +106,38 @@
       min-width: 0;
     }
 
-    /* Subtitle-style caption area: fixed height, no scrolling. column-reverse
-       pins the content to the bottom, so the newest lines are always visible
-       and the oldest are cut off at the top once the area is full. */
+    /* Keep the live caption stream in normal chronological order while
+   anchoring the newest captions to the bottom of the viewport. */
     .live-viewport {
       flex: 1 1 auto;
       min-height: 0;
       overflow: hidden;
       display: flex;
-      flex-direction: column-reverse;
+      flex-direction: column;
+      justify-content: flex-end;
       padding: 0.5rem 1.25rem;
     }
 
     #live {
       display: flex;
       flex-direction: column;
+      justify-content: flex-end;
     }
 
     .recall-panel {
+      position: relative;
       flex: 0 0 360px;
+    }
+
+    .latest-button {
+      position: absolute;
+      right: 1rem;
+      bottom: 1rem;
+      z-index: 2;
+      background: #294c6b;
+      color: #ffffff;
+      border: 0;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
     }
 
     .recall-panel[hidden] {
@@ -210,6 +223,12 @@
       border-bottom: 1px solid #e7edf3;
     }
 
+    .caption-row.latest-line {
+      background: #edf6ff;
+      border-left: 3px solid #4e8fc4;
+      font-weight: 600;
+    }
+
     .caption-time {
       flex: 0 0 auto;
       font-family: ui-monospace, monospace;
@@ -254,6 +273,9 @@
         </div>
         <p id="recall-empty" class="recall-empty hint" hidden></p>
         <div id="recall" class="recall-list"></div>
+          <button id="recall-latest" class="latest-button" hidden>
+            ↓ Newest caption
+          </button>
       </section>
     </main>
   </div>

@@ -210,12 +210,17 @@ function connect() {
   });
 }
 
-function setRecallWindow(seconds) {
+function setRecallWindow(seconds, followLatest = true) {
   recallSeconds = seconds;
-  recallFollow = true;
+  recallFollow = followLatest;
+
   for (const button of recallWindowButtons) {
-    button.setAttribute("aria-pressed", String(Number(button.dataset.seconds) === seconds));
+    button.setAttribute(
+      "aria-pressed",
+      String(Number(button.dataset.seconds) === seconds)
+    );
   }
+
   renderRecall();
 }
 
@@ -223,7 +228,11 @@ function setRecallWindow(seconds) {
 function openRecall() {
   recallPanel.hidden = false;
   recallOpenButton.setAttribute("aria-expanded", "true");
-  setRecallWindow(30);
+  setRecallWindow(30, false);
+
+  requestAnimationFrame(() => {
+    recallEl.scrollTop = 0;
+  });
 }
 
 function closeRecall() {
