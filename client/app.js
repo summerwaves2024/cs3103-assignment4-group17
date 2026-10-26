@@ -74,8 +74,11 @@ function applyCaption(msg) {
 function scheduleReconnect() {
   if (retryTimer !== null) return;
 
-  // make each failed attempt wait longer: 0.5s, 1s, 2s up to 10s max
-  const delay = Math.min(10000, 500 * 2 ** retryAttempt++);
+  // make each failed attempt wait longer: 0.5s, 1s, 2s up to 10s max,
+  // randomised between half and the full step so clients that dropped
+  // together don't all reconnect at the same moment
+  const cap = Math.min(10000, 500 * 2 ** retryAttempt++);
+  const delay = cap / 2 + Math.random() * (cap / 2);
   statusEl.textContent = `reconnecting in ${(delay / 1000).toFixed(1)} s`;
 
   retryTimer = setTimeout(() => {
