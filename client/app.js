@@ -1,33 +1,30 @@
-/*
- * Working but deliberately naive LiveRecall browser starter.
- *
- * Provided mechanical behavior:
- *   - opens a WebSocket
- *   - sends CLIENT_HELLO
- *   - visibly appends every received CAPTION_UPDATE
- *   - displays whether an update is provisional/final
- *
- * Graded TODOs:
- *   - replace revisions rather than appending duplicates
- *   - maintain >=60 s of finalized local state
- *   - implement 30 s default recall + 15/30/60 s views
- *   - automatic reconnect + correct resume state
- *   - HISTORY merge/deduplication
- *   - usable final UI
- */
-
 const WS_URL = "ws://127.0.0.1:8765";
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
 const recallEl = document.getElementById("recall");
+const recallEmptyEl = document.getElementById("recall-empty");
+const noticeEl = document.getElementById("notice");
+const recallPanel = document.getElementById("recall-panel");
+const appMainEl = document.querySelector(".app-main");
+const dividerEl = document.getElementById("divider");
+const recallOpenButton = document.getElementById("recall-open");
+const recallWindowButtons = document.querySelectorAll("button[data-seconds]");
+const recallLatestButton = document.getElementById("recall-latest");
 
 let ws;
 let lastFinal = { segment: 0, revision: 0 };
 let retryAttempt = 0;
 let retryTimer = null;
+let resumeFrom = 0; // last final segment this connection resumed from (0 = fresh join)
+let noticeTimer = null;
 let recallSeconds = 30;
+let recallFollow = false; // whether recall follows newly arriving captions
+let recallJumping = false; // smooth scroll to the newest caption in progress
+const recallRows = new Map(); // segment -> row in the recall list
 const captions = new Map(); // segment -> latest caption
 const elements = new Map(); // segment -> DOM element
+let latestLiveElement = null;
+const KEEP_SECONDS = 90; // messages beyond KEEP_SECONDS ago are no longer stored in device
 
 function numericClientId() {
   const key = "liverecall-client-id";
@@ -39,38 +36,118 @@ function numericClientId() {
   return Number(value);
 }
 
+function captionTime(caption) {
+  return new Date(caption.source_ts * 1000).toLocaleTimeString([], {
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  });
+}
+
+function fillCaptionRow(row, caption) {
+  row.className = "caption-row " + (caption.final ? "final-line" : "provisional-line");
+  const time = document.createElement("span");
+  time.className = "caption-time";
+  time.textContent = caption.final ? captionTime(caption) : "now";
+  const text = document.createElement("span");
+  text.className = "caption-text";
+  text.textContent = caption.text;
+  row.replaceChildren(time, text);
+}
+
 function renderRecall() {
+  if (recallPanel.hidden) return;
   const cutoff = Date.now() / 1000 - recallSeconds;
 
   const items = [...captions.values()]
     .filter(c => c.final && c.source_ts >= cutoff)
-    .sort((a, b) => a.source_ts - b.source_ts);
+    .sort((a, b) => a.segment - b.segment);
+  const inWindow = new Set(items.map(c => c.segment));
 
-  recallEl.replaceChildren();
-
-  if (items.length === 0) {
-    recallEl.textContent =
-      `No captions in the last ${recallSeconds} seconds.`;
-    return;
+  // Update the list in place instead of rebuilding
+  // so a user who scrolled up keeps their place. 
+  //
+  // For rows that left the window, remove them and
+  // scroll up by their height so the text being read
+  // does not move
+  let removedHeight = 0;
+  for (const [segment, row] of recallRows) {
+    if (!inWindow.has(segment)) {
+      removedHeight += row.offsetHeight;
+      row.remove();
+      recallRows.delete(segment);
+    }
+  }
+  if (!recallFollow) {
+    recallEl.scrollTop -= removedHeight;
   }
 
+  // Add new captions, in segment order.
   for (const caption of items) {
+    if (recallRows.has(caption.segment)) continue;
     const row = document.createElement("div");
-    row.textContent = caption.text;
-    recallEl.appendChild(row);
+    fillCaptionRow(row, caption);
+    const next = [...recallRows].find(([segment]) => segment > caption.segment);
+    recallEl.insertBefore(row, next ? next[1] : null);
+    recallRows.set(caption.segment, row);
   }
+
+  recallEmptyEl.hidden = items.length > 0;
+  recallEmptyEl.textContent = `No captions in the last ${recallSeconds} seconds.`;
+
+  if (recallFollow) {
+    recallEl.scrollTop = recallEl.scrollHeight;
+  }
+  updateLatestButton();
 }
 
+// Show "Newest caption" only when there is something below the visible part
+// of the list
+function updateLatestButton() {
+  recallLatestButton.hidden =
+    recallEl.scrollHeight - recallEl.scrollTop - recallEl.clientHeight < 8;
+}
+
+// Follow the newest caption while the user is at the bottom. Then stop as soon as
+// they scroll up to read, and resume when they scroll back down.
+recallEl.addEventListener("scroll", () => {
+  if (recallJumping) return;
+  recallFollow =
+    recallEl.scrollHeight - recallEl.scrollTop - recallEl.clientHeight < 8;
+
+  updateLatestButton();
+});
+
+// snap to the real bottom after the scroll animation
+// THis is to handle the cases where during scrolling, new
+// captions are added
+function finishRecallJump() {
+  if (!recallJumping) return;
+  recallJumping = false;
+  recallEl.scrollTop = recallEl.scrollHeight;
+}
+recallEl.addEventListener("scrollend", finishRecallJump);
+
+recallLatestButton.addEventListener("click", () => {
+  recallFollow = true;
+  recallJumping = true;
+  recallEl.scrollTo({
+    top: recallEl.scrollHeight,
+    behavior: "smooth",
+  });
+  recallLatestButton.hidden = true;
+  setTimeout(finishRecallJump, 1000); // fallback where "scrollend" is not supported
+});
+
+// Returns true if the caption was applied, false if it was stale or a duplicate.
 function applyCaption(msg) {
   const existingCaption = captions.get(msg.segment)
   
   // updating the caption
   if (existingCaption) {
     if (existingCaption.final) {
-      return
+      return false
     }
     if (msg.revision <= existingCaption.revision) {
-      return
+      return false
     }
   }
 
@@ -86,15 +163,25 @@ function applyCaption(msg) {
     liveEl.appendChild(line);
   }
 
-  line.className = "caption-row";
-  line.classList.add(msg.final ? "final-line" : "provisional-line");
-  line.textContent = 
-    `[${msg.final ? "FINAL" : "PROVISIONAL"}]` + 
-    `segment ${msg.segment} rev ${msg.revision}: ${msg.text}`;
+  latestLiveElement?.classList.remove("latest-line");
+  line.classList.add("latest-line");
+  latestLiveElement = line;
+  line.dataset.segment = String(msg.segment);
+
+
+  fillCaptionRow(line, msg);
  
   if (msg.final && msg.segment > lastFinal.segment) {
   lastFinal = { segment: msg.segment, revision: msg.revision };
   }
+  return true
+}
+
+function showNotice(text) {
+  noticeEl.textContent = text;
+  noticeEl.hidden = false;
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => { noticeEl.hidden = true; }, 6000);
 }
 
 function scheduleReconnect() {
@@ -105,7 +192,7 @@ function scheduleReconnect() {
   // together don't all reconnect at the same moment
   const cap = Math.min(10000, 500 * 2 ** retryAttempt++);
   const delay = cap / 2 + Math.random() * (cap / 2);
-  statusEl.textContent = `reconnecting in ${(delay / 1000).toFixed(1)} s`;
+  statusEl.textContent = `Reconnecting in ${(delay / 1000).toFixed(1)} s (attempt ${retryAttempt})`;
 
   retryTimer = setTimeout(() => {
     retryTimer = null;
@@ -115,12 +202,13 @@ function scheduleReconnect() {
 
 function connect() {
   statusEl.textContent = 
-  lastFinal.segment === 0 ? "connecting..." : "reconnecting...";
+  lastFinal.segment === 0 ? "Connecting…" : "Reconnecting…";
 
   ws = new WebSocket(WS_URL);
 
   ws.addEventListener("open", () => {
-    statusEl.textContent = "connected";
+    statusEl.textContent = "Live";
+    resumeFrom = lastFinal.segment;
     ws.send(JSON.stringify({
       type: "CLIENT_HELLO",
       client_id: numericClientId(),
@@ -138,8 +226,19 @@ function connect() {
     } else if (msg.type === "HISTORY") {
       console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
       // merge history without stale/duplicate final captions.
+      let recovered = 0;
       for (const item of msg.items ?? []) {
-        applyCaption(item)
+        if (applyCaption(item) && item.final) recovered++;
+      }
+
+      // Tell the user what recovery did.
+      const s = recovered === 1 ? "" : "s";
+      if (resumeFrom > 0) {
+        showNotice(recovered > 0
+          ? `Reconnected: recovered ${recovered} missed caption${s}, no duplicates.`
+          : "Reconnected. Nothing was missed.");
+      } else if (recovered > 0) {
+        showNotice(`Joined mid-lecture: loaded ${recovered} earlier caption${s}.`);
       }
 
       if (msg.active) {
@@ -151,25 +250,110 @@ function connect() {
   });
 
   ws.addEventListener("close", () => {
-    statusEl.textContent = "disconnected";
+    statusEl.textContent = "Connection lost";
     // automatic reconnect after a short delay, using finalized resume state.
     scheduleReconnect();
   });
 
   ws.addEventListener("error", () => {
-    statusEl.textContent = "connection error";
+    statusEl.textContent = "Connection lost";
   });
 }
 
-for (const button of document.querySelectorAll("button[data-seconds]")) {
-  button.addEventListener("click", () => {
-    recallSeconds = Number(button.dataset.seconds);
-    renderRecall();
+function setRecallWindow(seconds, followLatest = true) {
+  recallSeconds = seconds;
+  recallFollow = followLatest;
+
+  for (const button of recallWindowButtons) {
+    button.setAttribute(
+      "aria-pressed",
+      String(Number(button.dataset.seconds) === seconds)
+    );
+  }
+
+  renderRecall();
+}
+
+// "What did I miss?" opens on demand and always starts at the 30-second view
+function openRecall() {
+  recallPanel.hidden = false;
+  dividerEl.hidden = false;
+  recallOpenButton.setAttribute("aria-expanded", "true");
+  setRecallWindow(30, false);
+
+  requestAnimationFrame(() => {
+    recallEl.scrollTop = 0;
   });
 }
 
-// show the default 30-second view
-renderRecall();
-// update the recall view every second
-setInterval(renderRecall, 1000);
+function closeRecall() {
+  recallPanel.hidden = true;
+  dividerEl.hidden = true;
+  recallOpenButton.setAttribute("aria-expanded", "false");
+}
+
+recallOpenButton.addEventListener("click", () => {
+  if (recallPanel.hidden) {
+    openRecall();
+  } else {
+    closeRecall();
+  }
+});
+document.getElementById("recall-close").addEventListener("click", closeRecall);
+
+for (const button of recallWindowButtons) {
+  button.addEventListener("click", () => setRecallWindow(Number(button.dataset.seconds)));
+}
+
+// Resizing the recall panel by dragging the divider.
+// The width is kept between visits (width stored in local storage) and the live captions take the rest.
+const RECALL_MIN_WIDTH = 260;
+const RECALL_WIDTH_KEY = "liverecall-recall-width";
+
+function setRecallWidth(px) {
+  const width = Math.round(Math.min(Math.max(px, RECALL_MIN_WIDTH), appMainEl.clientWidth * 0.6));
+  appMainEl.style.setProperty("--recall-width", `${width}px`);
+  try { localStorage.setItem(RECALL_WIDTH_KEY, String(width)); } catch {}
+}
+
+dividerEl.addEventListener("pointerdown", (event) => {
+  const startX = event.clientX;
+  const startWidth = recallPanel.getBoundingClientRect().width;
+  dividerEl.setPointerCapture(event.pointerId);
+  document.body.classList.add("resizing");
+
+  // The recall panel is on the right, so dragging left makes it wider.
+  const onMove = (e) => setRecallWidth(startWidth + startX - e.clientX);
+  const onEnd = () => {
+    dividerEl.removeEventListener("pointermove", onMove);
+    dividerEl.removeEventListener("lostpointercapture", onEnd);
+    document.body.classList.remove("resizing");
+  };
+  dividerEl.addEventListener("pointermove", onMove);
+  dividerEl.addEventListener("lostpointercapture", onEnd);
+  event.preventDefault();
+});
+
+try {
+  const saved = Number(localStorage.getItem(RECALL_WIDTH_KEY));
+  if (saved > 0) appMainEl.style.setProperty("--recall-width", `${saved}px`);
+} catch {}
+
+function pruneOldCaptions() {
+  const cutoff = Date.now() / 1000 - KEEP_SECONDS;
+  for (const [segment, caption] of captions) {
+    if (caption.source_ts < cutoff) {
+      captions.delete(segment);
+      elements.get(segment)?.remove();
+      elements.delete(segment);
+    }
+  }
+}
+
+// every second: drop old captions, and keep the recall view current while it is open
+setInterval(() => {
+  pruneOldCaptions();
+  renderRecall();
+}, 1000);
+
 connect();

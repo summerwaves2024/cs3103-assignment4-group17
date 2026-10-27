@@ -3,6 +3,7 @@
 ## Team members
 
 - Ong Li Min / A0309313M / responsibility
+- <Name> / <Matric number> / <responsibility>
 
 ## Ubuntu setup
 

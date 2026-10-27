@@ -5,19 +5,239 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>LiveRecall Student Client</title>
   <style>
+    html, body {
+      height: 100%;
+      margin: 0;
+    }
+
     body {
       font-family: Inter, system-ui, sans-serif;
-      max-width: 1100px;
-      margin: 0 auto;
-      padding: 2rem;
       background: #f3f8fc;
       color: #172033;
     }
 
-    #live {
+    /* The app fills the window and never grows: header, then the main area
+       takes the remaining height. */
+    .app {
+      box-sizing: border-box;
+      height: 100vh;
+      height: 100dvh;
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 1.25rem 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .app-header {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+    }
+
+    .app-header h1 {
+      margin: 0;
+      font-size: 1.4rem;
+    }
+
+    .session {
+      font-family: ui-monospace, monospace;
+      font-size: 0.8rem;
+      color: #4a5864;
+    }
+
+    .status {
+      padding: 0.4rem 0.9rem;
+      border-radius: 999px;
       background: #ffffff;
       border: 1px solid #d9e5ef;
+      font-size: 0.9rem;
+    }
+
+    /* Live captions and "What did I miss?" side by side, sharing the height. */
+    .app-main {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: flex;
+    }
+
+    .panel {
+      background: #ffffff;
+      border: 1px solid #d9e5ef;
+      border-radius: 14px;
       box-shadow: 0 8px 24px rgba(43, 76, 109, 0.06);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      padding: 0.75rem 1.25rem;
+      border-bottom: 1px solid #e7edf3;
+    }
+
+    .panel-header h2 {
+      margin: 0;
+      font-size: 1rem;
+    }
+
+    .notice {
+      flex: 0 0 auto;
+      padding: 0.5rem 1.25rem;
+      background: #ddf3e8;
+      color: #0b4a2e;
+      font-size: 0.9rem;
+    }
+
+    .panel-footer {
+      flex: 0 0 auto;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.75rem 1.25rem;
+      border-top: 1px solid #e7edf3;
+    }
+
+    .live-panel {
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+
+    /* Keep the live caption stream in normal chronological order while
+   anchoring the newest captions to the bottom of the viewport. */
+    .live-viewport {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      padding: 0.5rem 1.25rem;
+    }
+
+    #live {
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+    }
+
+    /* Width set by dragging the divider (app.js sets --recall-width). */
+    .recall-panel {
+      position: relative;
+      flex: 0 0 var(--recall-width, 360px);
+      max-width: 60%;
+    }
+
+    /* Drag handle between the two panels; also the gap between them. */
+    .divider {
+      flex: 0 0 1.25rem;
+      cursor: col-resize;
+      touch-action: none;
+      display: flex;
+      justify-content: center;
+    }
+
+    .divider::before {
+      content: "";
+      width: 4px;
+      margin: 2rem 0;
+      border-radius: 2px;
+      background: transparent;
+    }
+
+    .divider:hover::before {
+      background: #c6d7e6;
+    }
+
+    .divider[hidden] {
+      display: none;
+    }
+
+    body.resizing {
+      cursor: col-resize;
+      user-select: none;
+    }
+
+    .latest-button {
+      position: absolute;
+      right: 1rem;
+      bottom: 1rem;
+      z-index: 2;
+      background: #294c6b;
+      color: #ffffff;
+      border: 0;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    }
+
+    .latest-button:hover {
+      background: #1f3b54;
+    }
+
+    .recall-panel[hidden] {
+      display: none;
+    }
+
+    .recall-windows {
+      flex: 0 0 auto;
+      display: flex;
+      gap: 0.5rem;
+      padding: 0.75rem 1.25rem 0;
+    }
+
+    .recall-windows button {
+      flex: 1;
+    }
+
+    .recall-windows button[aria-pressed="true"] {
+      background: #294c6b;
+      color: #ffffff;
+    }
+
+    /* The recall list is the one place that scrolls. app.js keeps the reading
+       position itself when old rows are removed, so native anchoring is off. */
+    .recall-list {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow-y: auto;
+      overflow-anchor: none;
+      padding: 0.75rem 1.25rem;
+    }
+
+    .recall-empty {
+      margin: 0;
+      padding: 0.75rem 1.25rem 0;
+    }
+
+    .hint {
+      font-size: 0.9rem;
+      color: #4a5864;
+    }
+
+    /* Narrow screens: stack the panels instead of side by side. */
+    @media (max-width: 800px) {
+      .app-main {
+        flex-direction: column;
+        gap: 1rem;
+      }
+
+      .recall-panel {
+        flex: 0 0 45%;
+        max-width: none;
+      }
+
+      .divider {
+        display: none;
+      }
     }
 
     .provisional-line {
@@ -34,6 +254,10 @@
       background: #ffffff;
       color: #294c6b;
       border: 1px solid #c6d7e6;
+      border-radius: 8px;
+      padding: 0.5rem 0.9rem;
+      font: inherit;
+      cursor: pointer;
     }
 
     button:hover {
@@ -47,19 +271,67 @@
       padding: 0.7rem 0;
       border-bottom: 1px solid #e7edf3;
     }
+
+    .caption-row.latest-line {
+      background: #edf6ff;
+      border-left: 3px solid #4e8fc4;
+      font-weight: 600;
+    }
+
+    .caption-time {
+      flex: 0 0 auto;
+      font-family: ui-monospace, monospace;
+      font-size: 0.8rem;
+      color: #4a5864;
+    }
   </style>
 </head>
 <body>
-  <h1>LiveRecall</h1>
-  <p>Connection: <span id="status">disconnected</span></p>
-  <p class="hint">Provisional captions are updated until they become final.</p>
-  <div id="live"></div>
-  <div>
-    <button data-seconds="30">What did I miss? (30 s)</button>
-    <button data-seconds="15">15 s</button>
-    <button data-seconds="60">60 s</button>
+  <div class="app">
+    <header class="app-header">
+      <div>
+        <h1>LiveRecall</h1>
+        <span class="session">Session L1</span>
+      </div>
+      <div id="status" class="status" role="status">disconnected</div>
+    </header>
+
+    <main class="app-main">
+      <section class="panel live-panel" aria-label="Live captions">
+        <div class="panel-header">
+          <h2>Live captions</h2>
+        </div>
+        <div id="notice" class="notice" role="status" hidden></div>
+        <div class="live-viewport">
+          <div id="live" aria-live="polite"></div>
+        </div>
+        <div class="panel-footer">
+          <button id="recall-open" aria-expanded="false" aria-controls="recall-panel">What did I miss?</button>
+          <span class="hint">Earlier lines: see the last 15, 30 or 60 s</span>
+        </div>
+      </section>
+
+      <div id="divider" class="divider" role="separator" aria-orientation="vertical"
+           aria-label="Resize the recall panel" hidden></div>
+
+      <section id="recall-panel" class="panel recall-panel" aria-label="What did I miss?" hidden>
+        <div class="panel-header">
+          <h2>What did I miss?</h2>
+          <button id="recall-close" aria-label="Close">&times;</button>
+        </div>
+        <div class="recall-windows" role="group" aria-label="Recall window">
+          <button data-seconds="15" aria-pressed="false">15 s</button>
+          <button data-seconds="30" aria-pressed="true">30 s</button>
+          <button data-seconds="60" aria-pressed="false">60 s</button>
+        </div>
+        <p id="recall-empty" class="recall-empty hint" hidden></p>
+        <div id="recall" class="recall-list"></div>
+          <button id="recall-latest" class="latest-button" hidden>
+            ↓ Newest caption
+          </button>
+      </section>
+    </main>
   </div>
-  <div id="recall"></div>
   <script src="app.js"></script>
 </body>
 </html>
