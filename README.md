@@ -2,7 +2,7 @@
 
 ## Team members
 
-- Ong Li Min / A0309313M / responsibility
+- Ong Li Min / A0309313M / browser client, UI and documentation
 - <Name> / <Matric number> / <responsibility>
 
 ## Overview
@@ -38,10 +38,10 @@ python solution_server.py --port 8765
 
 ## Browser client
 
-```bash 
+```bash
 python -m http.server 8000 --directory client
 ```
-Open http://127.0.0.1:8000
+Open `http://127.0.0.1:8000` in at least two browser windows.
 
 ## Public deterministic tests
 
@@ -53,29 +53,43 @@ Run each test at least three times and report the median result.
 python run_demo.py --clients 20 --duration 20 --runs 3
 ```
 
-### T2 - Public Scale 
+### T2 - Public scale
 ```bash
-python run_demo.py --clients 100 --duration 40 --runs 3
+python run_demo.py --clients 100 --duration 40 --runs 3 --output-stem t2
 ```
 
-### T3 - Slow Clients
-```bash 
-python run_demo.py --clients 100 --duration 60 --runs 3 --slow-percent 10 --slow-ms 500
+### T3 - Slow clients
+```bash
+python run_demo.py --clients 100 --duration 60 --runs 3 --slow-percent 10 --slow-ms 500 --output-stem t3
 ```
 
-### T4 - Reconnect 
-```bash 
-python run_demo.py --clients 100 --duration 60 --runs 3 --disconnect-percent 20 --disconnect-at 15 --disconnect-seconds 5
+### T4 - Reconnect
+```bash
+python run_demo.py --clients 100 --duration 60 --runs 3 --disconnect-percent 20 --disconnect-at 15 --disconnect-seconds 5 --output-stem t4
 ```
 
-### T5 - Network impairment 
-Run the server and clients inside Ubuntu and apply a suitable tc/netem profile from network_profiles/.
+### T5 - Network impairment
+Run the server and clients inside Ubuntu and apply a suitable `tc/netem` profile from `network_profiles/`. Reset the profile after testing.
 
 Record P50/P95/P99 caption age, final-caption completeness, freshness, update coverage, recovery time and slow-client behavior.
 
 ## Mandatory deterministic application demo
 
-Exact commands/steps for `caption_source.py`, browser clients, revision replacement, recall, late join, and reconnect/recovery.
+Start the server and browser client as described above, then run:
+
+```bash
+python caption_source.py --duration 120
+```
+
+Open at least two browser windows and demonstrate:
+
+- provisional captions being replaced by newer revisions;
+- distinct provisional and final caption styles;
+- the 30-second default recall view and the 15/30/60-second options;
+- temporary disconnection, automatic reconnect and incremental recovery;
+- no duplicate finalized captions after recovery;
+- late joining with recent context and continued live updates;
+- reconnect/late-join notices and recall-panel resizing.
 
 ## Design notes
 
@@ -86,7 +100,15 @@ Exact commands/steps for `caption_source.py`, browser clients, revision replacem
 - Each client has independent buffering so slow clients do not block normal clients.
 - Obsolete provisional revisions may be coalesced or discarded under pressure, while finalized captions are prioritized.
 - The browser stores recent finalized captions locally for recall.
+- Each client keeps pending finalized updates separately from the newest active provisional update.
+- The browser stores one DOM element per segment so revisions update existing rows instead of creating duplicates.
+- The recall panel supports oldest-first reading, newest-caption navigation and a persisted resizable width.
+- Connection notices report reconnecting, recovered captions and late-join history.
 
-## Optional ASR bonus
+## Public-test results
 
-Only if attempted. Keep these dependencies separate from the mandatory server path.
+Add the median results from three independent runs for T1-T5 here, including P50/P95/P99 caption age, freshness, final-caption completeness, normal update coverage, recovery time and slow-client behavior.
+
+## Submission files
+
+The final submission includes `solution_server.py`, `requirements.txt`, `client/`, `README.md`, `AI_USAGE.md`, `CONTRIBUTIONS.md` and `report.pdf`.

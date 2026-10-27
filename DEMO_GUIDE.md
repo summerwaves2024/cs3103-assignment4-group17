@@ -31,5 +31,7 @@ python caption_source.py --duration 120
 - `What did I miss?` defaults to 30 seconds and supports 15/30/60 seconds using local state under normal operation;
 - one client temporarily disconnects, reconnects automatically, and recovers recent missed finalized captions without duplicate finals;
 - a newly opened late client receives recent context and then continues with live updates.
+- reconnect and late-join notices report what was recovered;
+- the recall panel can be resized using the draggable divider and retains its width between sessions.
 
-The supplied browser is deliberately naive. It appends every revision so that the first revision-handling problem is visible immediately. Replace that behavior as part of your solution.
+The browser replaces newer revisions in place, keeps finalized captions locally for recall, and avoids displaying duplicate finalized captions after recovery.
