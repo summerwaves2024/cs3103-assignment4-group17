@@ -10,10 +10,6 @@ const dividerEl = document.getElementById("divider");
 const recallOpenButton = document.getElementById("recall-open");
 const recallWindowButtons = document.querySelectorAll("button[data-seconds]");
 const recallLatestButton = document.getElementById("recall-latest");
-<<<<<<< HEAD
-
-=======
->>>>>>> 167371cd12d1b087421c5a41cb69e3010d24baf7
 
 let ws;
 let lastFinal = { segment: 0, revision: 0 };
@@ -23,10 +19,7 @@ let resumeFrom = 0; // last final segment this connection resumed from (0 = fres
 let noticeTimer = null;
 let recallSeconds = 30;
 let recallFollow = false; // whether recall follows newly arriving captions
-<<<<<<< HEAD
-=======
 let recallJumping = false; // smooth scroll to the newest caption in progress
->>>>>>> 167371cd12d1b087421c5a41cb69e3010d24baf7
 const recallRows = new Map(); // segment -> row in the recall list
 const captions = new Map(); // segment -> latest caption
 const elements = new Map(); // segment -> DOM element
@@ -117,16 +110,6 @@ function updateLatestButton() {
 // Follow the newest caption while the user is at the bottom. Then stop as soon as
 // they scroll up to read, and resume when they scroll back down.
 recallEl.addEventListener("scroll", () => {
-<<<<<<< HEAD
-  recallFollow =
-    recallEl.scrollHeight - recallEl.scrollTop - recallEl.clientHeight < 8;
-
-  recallLatestButton.hidden = recallFollow;
-});
-
-recallLatestButton.addEventListener("click", () => {
-  recallFollow = true;
-=======
   if (recallJumping) return;
   recallFollow =
     recallEl.scrollHeight - recallEl.scrollTop - recallEl.clientHeight < 8;
@@ -135,8 +118,7 @@ recallLatestButton.addEventListener("click", () => {
 });
 
 // snap to the real bottom after the scroll animation
-// THis is to handle the cases where during scrolling, new
-// captions are added
+// This handles cases where new captions arrive during scrolling.
 function finishRecallJump() {
   if (!recallJumping) return;
   recallJumping = false;
@@ -147,16 +129,12 @@ recallEl.addEventListener("scrollend", finishRecallJump);
 recallLatestButton.addEventListener("click", () => {
   recallFollow = true;
   recallJumping = true;
->>>>>>> 167371cd12d1b087421c5a41cb69e3010d24baf7
   recallEl.scrollTo({
     top: recallEl.scrollHeight,
     behavior: "smooth",
   });
   recallLatestButton.hidden = true;
-<<<<<<< HEAD
-=======
   setTimeout(finishRecallJump, 1000); // fallback where "scrollend" is not supported
->>>>>>> 167371cd12d1b087421c5a41cb69e3010d24baf7
 });
 
 // Returns true if the caption was applied, false if it was stale or a duplicate.
@@ -229,7 +207,7 @@ function connect() {
   ws = new WebSocket(WS_URL);
 
   ws.addEventListener("open", () => {
-    statusEl.textContent = "Live";
+    statusEl.textContent = "● Live";
     resumeFrom = lastFinal.segment;
     ws.send(JSON.stringify({
       type: "CLIENT_HELLO",
