@@ -19,6 +19,7 @@ let resumeFrom = 0; // last final segment this connection resumed from (0 = fres
 let noticeTimer = null;
 let recallSeconds = 30;
 let recallFollow = false; // whether recall follows newly arriving captions
+let recallJumping = false; // smooth scroll to the newest caption in progress
 const recallRows = new Map(); // segment -> row in the recall list
 const captions = new Map(); // segment -> latest caption
 const elements = new Map(); // segment -> DOM element
@@ -78,7 +79,6 @@ function renderRecall() {
   if (!recallFollow) {
     recallEl.scrollTop -= removedHeight;
   }
-  recallLatestButton.hidden = recallFollow;
 
   // Add new captions, in segment order.
   for (const caption of items) {
@@ -96,24 +96,45 @@ function renderRecall() {
   if (recallFollow) {
     recallEl.scrollTop = recallEl.scrollHeight;
   }
+  updateLatestButton();
+}
+
+// Show "Newest caption" only when there is something below the visible part
+// of the list
+function updateLatestButton() {
+  recallLatestButton.hidden =
+    recallEl.scrollHeight - recallEl.scrollTop - recallEl.clientHeight < 8;
 }
 
 // Follow the newest caption while the user is at the bottom. Then stop as soon as
 // they scroll up to read, and resume when they scroll back down.
 recallEl.addEventListener("scroll", () => {
+  if (recallJumping) return;
   recallFollow =
     recallEl.scrollHeight - recallEl.scrollTop - recallEl.clientHeight < 8;
 
-  recallLatestButton.hidden = recallFollow;
+  updateLatestButton();
 });
+
+// snap to the real bottom after the scroll animation
+// THis is to handle the cases where during scrolling, new
+// captions are added
+function finishRecallJump() {
+  if (!recallJumping) return;
+  recallJumping = false;
+  recallEl.scrollTop = recallEl.scrollHeight;
+}
+recallEl.addEventListener("scrollend", finishRecallJump);
 
 recallLatestButton.addEventListener("click", () => {
   recallFollow = true;
+  recallJumping = true;
   recallEl.scrollTo({
     top: recallEl.scrollHeight,
     behavior: "smooth",
   });
   recallLatestButton.hidden = true;
+  setTimeout(finishRecallJump, 1000); // fallback where "scrollend" is not supported
 });
 
 // Returns true if the caption was applied, false if it was stale or a duplicate.
