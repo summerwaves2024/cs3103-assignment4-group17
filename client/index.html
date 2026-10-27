@@ -62,7 +62,6 @@
       flex: 1 1 auto;
       min-height: 0;
       display: flex;
-      gap: 1.25rem;
     }
 
     .panel {
@@ -132,9 +131,41 @@
       justify-content: flex-end;
     }
 
+    /* Width set by dragging the divider (app.js sets --recall-width). */
     .recall-panel {
       position: relative;
-      flex: 0 0 360px;
+      flex: 0 0 var(--recall-width, 360px);
+      max-width: 60%;
+    }
+
+    /* Drag handle between the two panels; also the gap between them. */
+    .divider {
+      flex: 0 0 1.25rem;
+      cursor: col-resize;
+      touch-action: none;
+      display: flex;
+      justify-content: center;
+    }
+
+    .divider::before {
+      content: "";
+      width: 4px;
+      margin: 2rem 0;
+      border-radius: 2px;
+      background: transparent;
+    }
+
+    .divider:hover::before {
+      background: #c6d7e6;
+    }
+
+    .divider[hidden] {
+      display: none;
+    }
+
+    body.resizing {
+      cursor: col-resize;
+      user-select: none;
     }
 
     .latest-button {
@@ -146,6 +177,10 @@
       color: #ffffff;
       border: 0;
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    }
+
+    .latest-button:hover {
+      background: #1f3b54;
     }
 
     .recall-panel[hidden] {
@@ -192,10 +227,16 @@
     @media (max-width: 800px) {
       .app-main {
         flex-direction: column;
+        gap: 1rem;
       }
 
       .recall-panel {
         flex: 0 0 45%;
+        max-width: none;
+      }
+
+      .divider {
+        display: none;
       }
     }
 
@@ -269,6 +310,9 @@
           <span class="hint">Earlier lines: see the last 15, 30 or 60 s</span>
         </div>
       </section>
+
+      <div id="divider" class="divider" role="separator" aria-orientation="vertical"
+           aria-label="Resize the recall panel" hidden></div>
 
       <section id="recall-panel" class="panel recall-panel" aria-label="What did I miss?" hidden>
         <div class="panel-header">

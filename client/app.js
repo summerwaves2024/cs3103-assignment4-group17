@@ -1,21 +1,3 @@
-/*
- * Working but deliberately naive LiveRecall browser starter.
- *
- * Provided mechanical behavior:
- *   - opens a WebSocket
- *   - sends CLIENT_HELLO
- *   - visibly appends every received CAPTION_UPDATE
- *   - displays whether an update is provisional/final
- *
- * Graded TODOs:
- *   - replace revisions rather than appending duplicates
- *   - maintain >=60 s of finalized local state
- *   - implement 30 s default recall + 15/30/60 s views
- *   - automatic reconnect + correct resume state
- *   - HISTORY merge/deduplication
- *   - usable final UI
- */
-
 const WS_URL = "ws://127.0.0.1:8765";
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
@@ -23,10 +5,15 @@ const recallEl = document.getElementById("recall");
 const recallEmptyEl = document.getElementById("recall-empty");
 const noticeEl = document.getElementById("notice");
 const recallPanel = document.getElementById("recall-panel");
+const appMainEl = document.querySelector(".app-main");
+const dividerEl = document.getElementById("divider");
 const recallOpenButton = document.getElementById("recall-open");
 const recallWindowButtons = document.querySelectorAll("button[data-seconds]");
 const recallLatestButton = document.getElementById("recall-latest");
+<<<<<<< HEAD
 
+=======
+>>>>>>> 167371cd12d1b087421c5a41cb69e3010d24baf7
 
 let ws;
 let lastFinal = { segment: 0, revision: 0 };
@@ -36,6 +23,10 @@ let resumeFrom = 0; // last final segment this connection resumed from (0 = fres
 let noticeTimer = null;
 let recallSeconds = 30;
 let recallFollow = false; // whether recall follows newly arriving captions
+<<<<<<< HEAD
+=======
+let recallJumping = false; // smooth scroll to the newest caption in progress
+>>>>>>> 167371cd12d1b087421c5a41cb69e3010d24baf7
 const recallRows = new Map(); // segment -> row in the recall list
 const captions = new Map(); // segment -> latest caption
 const elements = new Map(); // segment -> DOM element
@@ -113,11 +104,20 @@ function renderRecall() {
   if (recallFollow) {
     recallEl.scrollTop = recallEl.scrollHeight;
   }
+  updateLatestButton();
+}
+
+// Show "Newest caption" only when there is something below the visible part
+// of the list
+function updateLatestButton() {
+  recallLatestButton.hidden =
+    recallEl.scrollHeight - recallEl.scrollTop - recallEl.clientHeight < 8;
 }
 
 // Follow the newest caption while the user is at the bottom. Then stop as soon as
 // they scroll up to read, and resume when they scroll back down.
 recallEl.addEventListener("scroll", () => {
+<<<<<<< HEAD
   recallFollow =
     recallEl.scrollHeight - recallEl.scrollTop - recallEl.clientHeight < 8;
 
@@ -126,11 +126,37 @@ recallEl.addEventListener("scroll", () => {
 
 recallLatestButton.addEventListener("click", () => {
   recallFollow = true;
+=======
+  if (recallJumping) return;
+  recallFollow =
+    recallEl.scrollHeight - recallEl.scrollTop - recallEl.clientHeight < 8;
+
+  updateLatestButton();
+});
+
+// snap to the real bottom after the scroll animation
+// THis is to handle the cases where during scrolling, new
+// captions are added
+function finishRecallJump() {
+  if (!recallJumping) return;
+  recallJumping = false;
+  recallEl.scrollTop = recallEl.scrollHeight;
+}
+recallEl.addEventListener("scrollend", finishRecallJump);
+
+recallLatestButton.addEventListener("click", () => {
+  recallFollow = true;
+  recallJumping = true;
+>>>>>>> 167371cd12d1b087421c5a41cb69e3010d24baf7
   recallEl.scrollTo({
     top: recallEl.scrollHeight,
     behavior: "smooth",
   });
   recallLatestButton.hidden = true;
+<<<<<<< HEAD
+=======
+  setTimeout(finishRecallJump, 1000); // fallback where "scrollend" is not supported
+>>>>>>> 167371cd12d1b087421c5a41cb69e3010d24baf7
 });
 
 // Returns true if the caption was applied, false if it was stale or a duplicate.
@@ -273,6 +299,7 @@ function setRecallWindow(seconds, followLatest = true) {
 // "What did I miss?" opens on demand and always starts at the 30-second view
 function openRecall() {
   recallPanel.hidden = false;
+  dividerEl.hidden = false;
   recallOpenButton.setAttribute("aria-expanded", "true");
   setRecallWindow(30, false);
 
@@ -283,6 +310,7 @@ function openRecall() {
 
 function closeRecall() {
   recallPanel.hidden = true;
+  dividerEl.hidden = true;
   recallOpenButton.setAttribute("aria-expanded", "false");
 }
 
@@ -298,6 +326,40 @@ document.getElementById("recall-close").addEventListener("click", closeRecall);
 for (const button of recallWindowButtons) {
   button.addEventListener("click", () => setRecallWindow(Number(button.dataset.seconds)));
 }
+
+// Resizing the recall panel by dragging the divider.
+// The width is kept between visits (width stored in local storage) and the live captions take the rest.
+const RECALL_MIN_WIDTH = 260;
+const RECALL_WIDTH_KEY = "liverecall-recall-width";
+
+function setRecallWidth(px) {
+  const width = Math.round(Math.min(Math.max(px, RECALL_MIN_WIDTH), appMainEl.clientWidth * 0.6));
+  appMainEl.style.setProperty("--recall-width", `${width}px`);
+  try { localStorage.setItem(RECALL_WIDTH_KEY, String(width)); } catch {}
+}
+
+dividerEl.addEventListener("pointerdown", (event) => {
+  const startX = event.clientX;
+  const startWidth = recallPanel.getBoundingClientRect().width;
+  dividerEl.setPointerCapture(event.pointerId);
+  document.body.classList.add("resizing");
+
+  // The recall panel is on the right, so dragging left makes it wider.
+  const onMove = (e) => setRecallWidth(startWidth + startX - e.clientX);
+  const onEnd = () => {
+    dividerEl.removeEventListener("pointermove", onMove);
+    dividerEl.removeEventListener("lostpointercapture", onEnd);
+    document.body.classList.remove("resizing");
+  };
+  dividerEl.addEventListener("pointermove", onMove);
+  dividerEl.addEventListener("lostpointercapture", onEnd);
+  event.preventDefault();
+});
+
+try {
+  const saved = Number(localStorage.getItem(RECALL_WIDTH_KEY));
+  if (saved > 0) appMainEl.style.setProperty("--recall-width", `${saved}px`);
+} catch {}
 
 function pruneOldCaptions() {
   const cutoff = Date.now() / 1000 - KEEP_SECONDS;
