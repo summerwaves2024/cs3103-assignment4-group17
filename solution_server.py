@@ -29,8 +29,9 @@ import json
 import time
 from typing import Any
 from collections import deque
-from data_structs import Caption, ClientState, SourceHello, ClientHello
+from data_structs import BaseClientState, Caption, ClientState, SourceHello, ClientHello
 from revision_state_manager import RevisionStateManager
+from flow_controlz import FlowControlManager
 
 import websockets
 from websockets.asyncio.server import ServerConnection
@@ -39,15 +40,14 @@ HISTORY_KEEP_SECONDS = 90
 MAX_HISTORY_SECONDS = 60
 DEFAULT_HISTORY_SECONDS = 30
 MAX_PENDING_FINALS = 256  # maximum for per-client backlog
-STREAM_WINDOW = 10.0 # duration of the window used to measure the source stream rate, which is then used in flow control
 
 
 
 finals_log: deque[Caption] = deque()  # finals in segment order, trimmed to HISTORY_KEEP_SECONDS
 active: Caption | None = None          # newest draft of the current segment
-clients: dict[ServerConnection, ClientState] = {} # keyed by socket
+clients: dict[ServerConnection, BaseClientState] = {} # keyed by socket
 rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO
-update_times: deque[float] = deque() # source updates used to measure stream rate
+flow_control = FlowControlManager()
 
 
 
@@ -87,12 +87,6 @@ def trim_finals_log(now: float) -> None:
         rsm.prune(pruned_seg)
 
 
-def stream_rate(now: float) -> float:
-    while update_times and update_times[0] < now - STREAM_WINDOW:
-        update_times.popleft()
-    return len(update_times) / STREAM_WINDOW
-
-
 def on_draft(caption: Caption) -> None:
     global active
     active = caption
@@ -112,6 +106,7 @@ def on_final(caption: Caption) -> None:
     if active is not None and active.segment == caption.segment:
         active = None
     for state in clients.values():
+        caption.queue_ts = time.monotonic()
         state.pending_finals.append(caption)
         # The final supersedes any unsent draft of the same segment.
         if state.pending_active is not None and state.pending_active.segment == caption.segment:
@@ -119,43 +114,24 @@ def on_final(caption: Caption) -> None:
         state.wake.set()
 
 
-def log_mode(state: ClientState, now: float) -> None:
-    """Print the client's flow-control state whenever it changes."""
-    old = state.flow.update_mode(now, stream_rate(now))
-    if old is not None:
-        print(f"client {state.client_id}: {old.name} -> {state.flow.mode.name}", flush=True)
-
-
-def on_pong(state: ClientState, fut: asyncio.Future) -> None:
-    if fut.cancelled() or fut.exception() is not None:
-        return
-    now = time.monotonic()
-    state.flow.on_pong(now, stream_rate(now))
-    log_mode(state, now)
-    state.wake.set()  # re-check a held draft
-
-
-async def client_sender(state: ClientState) -> None:
+async def client_sender(state: BaseClientState) -> None:
     """Per-client sender: every final in order, then only the newest draft.
 
     This is the only place that awaits ws.send for this client, so a slow
     client never blocks the source or the other clients.
     """
-    flow = state.flow
     try:
         while True:
             await state.wake.wait()
             state.wake.clear()
             while state.pending_finals or state.pending_active is not None:
-                now = time.monotonic()
                 # send unsent finals first (from oldest to newest)
                 if state.pending_finals:
                     caption = state.pending_finals.popleft()
-                    state.last_final = (caption.segment, caption.revision)
+                    state.inflight_final = caption
                 # if no more finals left to send, send the actively changing one
                 else:
-                    log_mode(state, now)
-                    delay = flow.draft_delay(now, stream_rate(now))
+                    delay = state.draft_delay()
                     if delay is None or delay > 0:
                         # Client is behind: hold the draft (a newer one may replace
                         # it). Wait `delay` seconds, or with no timeout (None) until
@@ -168,14 +144,13 @@ async def client_sender(state: ClientState) -> None:
                         continue
                     caption = state.pending_active
                     state.pending_active = None
-                await state.ws.send(json.dumps(caption_to_dict(caption)))
-                flow.on_send()
-                # Ping after sending: the pong only returns once the client has
-                # read up to here, which is how flow control sees its lag.
-                if flow.should_probe(now):
-                    flow.on_probe(now)
-                    pong = await state.ws.ping()
-                    pong.add_done_callback(lambda fut: on_pong(state, fut))
+                try:
+                    await state.ws.send(json.dumps(caption_to_dict(caption)))
+                    if caption.final:
+                        state.last_final = (caption.segment, caption.revision)
+                finally:
+                    state.inflight_final = None
+                await state.after_send()
     except websockets.ConnectionClosed:
         pass  # handle_client's finally does the cleanup
 
@@ -207,13 +182,7 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
                 if not is_accepted:
                     continue
 
-                now = time.monotonic()
-
-                # Prune update_times so that the flow calculation is bounded even if no clients
-                # are connected
-                stream_rate(now)
-
-                update_times.append(now)
+                flow_control.record_update()
 
                 if caption.final:
                     on_final(caption)
@@ -256,9 +225,16 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
 
     items = history_items(last_segment, history_seconds, time.time())
     pending = active if active is not None and active.segment > last_segment else None
-    state = ClientState(ws=ws, pending_finals=deque(maxlen=MAX_PENDING_FINALS),
-                        pending_active=pending, last_final=(last_segment, last_revision),
-                        client_id=client_id)
+    wake = asyncio.Event()
+    client_options = dict(ws=ws, pending_finals=deque(maxlen=MAX_PENDING_FINALS),
+                          pending_active=pending, last_final=(last_segment, last_revision),
+                          client_id=client_id, wake=wake)
+    state: BaseClientState
+    if flow_control.enabled:
+        state = ClientState(**client_options,
+                            flow=flow_control.create_policy(ws, wake, client_id))
+    else:
+        state = BaseClientState(**client_options)
     clients[ws] = state
     print(f"client connected: id={client_id}; last_segment={last_segment}; "
           f"history={len(items)}; clients={len(clients)}", flush=True)
@@ -277,9 +253,11 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         pass
     finally:
         clients.pop(ws, None)
+        state.close()
         if state.sender is not None:
             state.sender.cancel()
-        print(f"client disconnected: id={client_id}; mode={state.flow.mode.name}; "
+            await asyncio.gather(state.sender, return_exceptions=True)
+        print(f"client disconnected: id={client_id}; mode={state.delivery_status}; "
               f"drafts_dropped={state.drafts_dropped}; "
               f"clients={len(clients)}", flush=True)
 
@@ -301,7 +279,9 @@ async def handler(ws) -> None:
         await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
 
 
-async def main_async(port: int) -> None:
+async def main_async(port: int, flow_control_mode: str = "adaptive") -> None:
+    global flow_control
+    flow_control = FlowControlManager(enabled=flow_control_mode == "adaptive")
     async with websockets.serve(
         handler,
         "0.0.0.0",
@@ -317,9 +297,11 @@ async def main_async(port: int) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--flow-control", choices=("adaptive", "none"), default="adaptive",
+                        help="Flow-control policy (default: adaptive)")
     args = parser.parse_args()
     try:
-        asyncio.run(main_async(args.port))
+        asyncio.run(main_async(args.port, args.flow_control))
     except KeyboardInterrupt:
         pass
 

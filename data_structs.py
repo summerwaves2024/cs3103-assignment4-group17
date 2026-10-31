@@ -3,7 +3,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Literal, NotRequired, TypedDict
 
-from flow_control import FlowControl
+from flow_controlz import DeliveryPolicy
 
 class SourceHello(TypedDict):
     type : Literal["SOURCE_HELLO"]
@@ -23,6 +23,7 @@ class Caption:
     segment : int
     revision : int
     source_ts : float
+    queue_ts : float
     final : bool
     text : str
 
@@ -32,21 +33,56 @@ class Caption:
         segment = caption_dict.get("segment")
         revision = caption_dict.get("revision")
         source_ts = caption_dict.get("source_ts")
+        queue_ts = caption_dict.get("queue_ts")
         final = caption_dict.get("final")
         text = caption_dict.get("text")
         return cls(session, segment, revision,
-                   source_ts, final, text)
+                   source_ts, queue_ts, final, text)
 
 
 @dataclass
-class ClientState:
+class BaseClientState:
+  """Normal caption delivery state, usable without a flow-control component."""
   ws : object # WebSocket Object
   pending_finals : deque[Caption]
   pending_active : Caption | None
   last_final : tuple[int, int]  # (segment, revision)
+  inflight_final : Caption | None = None
   client_id : object = None # from CLIENT_HELLO, for logs
   wake : asyncio.Event = field(default_factory=asyncio.Event) # tell the sender task there is work to do
                                                               # so we can individually send rather than broadcast
   sender : asyncio.Task | None = None
   drafts_dropped : int = 0 # drafts overwritten before they could be sent
-  flow : FlowControl = field(default_factory=FlowControl)
+
+  def draft_delay(self) -> float | None:
+    return 0.0
+
+  async def after_send(self) -> None:
+    pass
+
+  def close(self) -> None:
+    pass
+
+  @property
+  def delivery_status(self) -> str:
+    return "DISABLED"
+
+
+@dataclass
+class ClientState(BaseClientState):
+  """Extend normal client delivery with a replaceable flow-control policy."""
+
+  flow: DeliveryPolicy = field(kw_only=True)
+
+  def draft_delay(self) -> float | None:
+    return self.flow.draft_delay()
+
+  async def after_send(self) -> None:
+    await self.flow.after_send()
+
+  def close(self) -> None:
+    self.flow.close()
+
+  @property
+  def delivery_status(self) -> str:
+    return self.flow.status
