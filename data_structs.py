@@ -2,8 +2,7 @@ import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Literal, NotRequired, TypedDict
-
-from flow_controlz import DeliveryPolicy
+from delivery_policy import DeliveryPolicy
 
 class SourceHello(TypedDict):
     type : Literal["SOURCE_HELLO"]
@@ -48,6 +47,7 @@ class BaseClientState:
   pending_active : Caption | None
   last_final : tuple[int, int]  # (segment, revision)
   inflight_final : Caption | None = None
+  send_started_t : float | None = None
   client_id : object = None # from CLIENT_HELLO, for logs
   wake : asyncio.Event = field(default_factory=asyncio.Event) # tell the sender task there is work to do
                                                               # so we can individually send rather than broadcast
@@ -60,8 +60,17 @@ class BaseClientState:
   async def after_send(self) -> None:
     pass
 
+  def start(self) -> None:
+    pass
+
+  def record_update(self, now: float, final: bool) -> None:
+    pass
+
   def close(self) -> None:
     pass
+
+  async def aclose(self) -> None:
+    self.close()
 
   @property
   def delivery_status(self) -> str:
@@ -80,8 +89,17 @@ class ClientState(BaseClientState):
   async def after_send(self) -> None:
     await self.flow.after_send()
 
+  def start(self) -> None:
+    self.flow.start()
+
+  def record_update(self, now: float, final: bool) -> None:
+    self.flow.record_update(now, final)
+
   def close(self) -> None:
     self.flow.close()
+
+  async def aclose(self) -> None:
+    await self.flow.aclose()
 
   @property
   def delivery_status(self) -> str:

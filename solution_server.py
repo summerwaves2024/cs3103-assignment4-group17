@@ -27,11 +27,13 @@ import argparse
 import asyncio
 import json
 import time
+from dataclasses import replace
+from importlib import import_module
 from typing import Any
 from collections import deque
 from data_structs import BaseClientState, Caption, ClientState, SourceHello, ClientHello
 from revision_state_manager import RevisionStateManager
-from flow_controlz import FlowControlManager
+from flow_control import FlowControlManager
 
 import websockets
 from websockets.asyncio.server import ServerConnection
@@ -106,8 +108,8 @@ def on_final(caption: Caption) -> None:
     if active is not None and active.segment == caption.segment:
         active = None
     for state in clients.values():
-        caption.queue_ts = time.monotonic()
-        state.pending_finals.append(caption)
+        # Queue timing belongs to each client, not the shared source caption.
+        state.pending_finals.append(replace(caption, queue_ts=time.monotonic()))
         # The final supersedes any unsent draft of the same segment.
         if state.pending_active is not None and state.pending_active.segment == caption.segment:
             state.pending_active = None
@@ -145,11 +147,13 @@ async def client_sender(state: BaseClientState) -> None:
                     caption = state.pending_active
                     state.pending_active = None
                 try:
+                    state.send_started_t = time.monotonic()
                     await state.ws.send(json.dumps(caption_to_dict(caption)))
                     if caption.final:
                         state.last_final = (caption.segment, caption.revision)
                 finally:
                     state.inflight_final = None
+                    state.send_started_t = None
                 await state.after_send()
     except websockets.ConnectionClosed:
         pass  # handle_client's finally does the cleanup
@@ -182,7 +186,12 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
                 if not is_accepted:
                     continue
 
-                flow_control.record_update()
+                now = time.monotonic()
+                # Managers may keep shared measurements; policies may track
+                # per-client recovery trials. Both receive accepted updates only.
+                flow_control.record_update(now, caption.final)
+                for state in clients.values():
+                    state.record_update(now, caption.final)
 
                 if caption.final:
                     on_final(caption)
@@ -232,7 +241,11 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
     state: BaseClientState
     if flow_control.enabled:
         state = ClientState(**client_options,
-                            flow=flow_control.create_policy(ws, wake, client_id))
+                            flow=flow_control.create_policy(
+                                ws, wake, client_id,
+                                get_finals=lambda: (state.pending_finals, state.inflight_final),
+                                get_send_started=lambda: state.send_started_t,
+                            ))
     else:
         state = BaseClientState(**client_options)
     clients[ws] = state
@@ -240,8 +253,15 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
           f"history={len(items)}; clients={len(clients)}", flush=True)
 
     try:
-        await ws.send(json.dumps({"type": "HISTORY",
-                                  "items": [caption_to_dict(c) for c in items]}))
+        # Callbacks can now read the fully constructed state. Start before
+        # history so a stalled history transfer is visible to the monitor.
+        state.start()
+        state.send_started_t = time.monotonic()
+        try:
+            await ws.send(json.dumps({"type": "HISTORY",
+                                      "items": [caption_to_dict(c) for c in items]}))
+        finally:
+            state.send_started_t = None
         # The current draft (if any) follows as a normal CAPTION_UPDATE.
         state.sender = asyncio.create_task(client_sender(state))
         state.wake.set()
@@ -257,6 +277,7 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         if state.sender is not None:
             state.sender.cancel()
             await asyncio.gather(state.sender, return_exceptions=True)
+        await state.aclose()
         print(f"client disconnected: id={client_id}; mode={state.delivery_status}; "
               f"drafts_dropped={state.drafts_dropped}; "
               f"clients={len(clients)}", flush=True)
@@ -279,9 +300,15 @@ async def handler(ws) -> None:
         await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
 
 
-async def main_async(port: int, flow_control_mode: str = "adaptive") -> None:
+async def main_async(port: int, flow_control_mode: str = "adaptive",
+                     flow_control_module: str | None = None) -> None:
     global flow_control
-    flow_control = FlowControlManager(enabled=flow_control_mode == "adaptive")
+    manager_type = FlowControlManager
+    if flow_control_module is not None:
+        if flow_control_module not in ("flow_control", "flow_controlz"):
+            raise ValueError("Unknown flow-control module")
+        manager_type = import_module(flow_control_module).FlowControlManager
+    flow_control = manager_type(enabled=flow_control_mode == "adaptive")
     async with websockets.serve(
         handler,
         "0.0.0.0",
@@ -299,9 +326,11 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--flow-control", choices=("adaptive", "none"), default="adaptive",
                         help="Flow-control policy (default: adaptive)")
+    parser.add_argument("--flow-control-module", choices=("flow_control", "flow_controlz"),
+                        help="Implementation module (default: imported FlowControlManager)")
     args = parser.parse_args()
     try:
-        asyncio.run(main_async(args.port, args.flow_control))
+        asyncio.run(main_async(args.port, args.flow_control, args.flow_control_module))
     except KeyboardInterrupt:
         pass
 
