@@ -4,6 +4,8 @@
 
 List the generative-AI/coding tools used by the team and what each was used for.
 
+Codex was used with helping for designing the UI with respect to the client/index.html. 
+
 ## One useful suggestion
 
 Describe one suggestion that materially helped the project and how you verified it.
