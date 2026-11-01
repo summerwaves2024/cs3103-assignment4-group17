@@ -1,24 +1,12 @@
 #!/usr/bin/env python3
 """
-CS3103 Assignment 4 - LiveRecall naive working baseline.
-
-This starter is intentionally useful but incomplete. It provides the required
-CLI and a basic WebSocket broadcaster so that caption_source.py -> server ->
-browser/load clients works on day one.
-
-It DOES NOT implement the graded networking mechanisms:
-  - revision-state management or deduplication
-  - recent-history recovery or late-join recovery
-  - bounded per-client application queues
-  - slow-client isolation
-  - semantic coalescing / backpressure
-  - constrained-bandwidth overload handling
+This is the fully implemented WebSocket broadcaster in which accepts caption 
+updates from the determinstic source, validates revisions, maintains bounded
+finalised-caption history and broadcasts updates to browse clients
+with per-client flow control and reconnect recovery. 
 
 Required evaluator command:
     python solution_server.py --port 8765
-
-Teams should replace or substantially extend the implementation while keeping
-this command-line interface and the protocol in the assignment specification.
 """
 
 from __future__ import annotations
@@ -35,36 +23,39 @@ from revision_state_manager import RevisionStateManager
 import websockets
 from websockets.asyncio.server import ServerConnection
 
-HISTORY_KEEP_SECONDS = 90
-MAX_HISTORY_SECONDS = 60
-DEFAULT_HISTORY_SECONDS = 30
+HISTORY_KEEP_SECONDS = 90 # how long the server keeps finaslied captions 
+MAX_HISTORY_SECONDS = 60 # the maximum history a client can request 
+DEFAULT_HISTORY_SECONDS = 30 # default/recall window when the client does not specify one
 MAX_PENDING_FINALS = 256  # maximum for per-client backlog
-STREAM_WINDOW = 10.0 # duration of the window used to measure the source stream rate, which is then used in flow control
-
-
+STREAM_WINDOW = 10.0 # duration of the window used to measure the source stream rate, which is then used in flow control to see if the client can keep up
 
 finals_log: deque[Caption] = deque()  # finals in segment order, trimmed to HISTORY_KEEP_SECONDS
 active: Caption | None = None          # newest draft of the current segment
-clients: dict[ServerConnection, ClientState] = {} # keyed by socket
-rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO
+clients: dict[ServerConnection, ClientState] = {} # tracks every connected client and its queue, flow-control and recovery position
+rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO; stores the revision manager to validate and update segments
 update_times: deque[float] = deque() # source updates used to measure stream rate
 
-
-
+# In charge of parsing and validating an incoming caption message from the original source.
 def parse_caption(msg: dict[str, Any]) -> Caption | None:
     try:
+        # Converts to the expected types. 
         caption = Caption.from_dict(msg)
         caption.segment = int(caption.segment)
         caption.revision = int(caption.revision)
         caption.source_ts = float(caption.source_ts)
     except (TypeError, ValueError):
         return None
+    # Rejects revisions below 1 and ensures the caption text is a string. 
     if caption.revision < 1 or not isinstance(caption.text, str):
         return None
+    # Converts the final-status field to a Boolean. 
     caption.final = bool(caption.final)
     return caption
 
-
+# Converts an internal Caption object into a JSON-compatible 
+# dictionary for WebSocket transmission. 
+# By sending only the necessary things, it ensures that the message
+# is small and avoids exposing unnecessary server-side data. 
 def caption_to_dict(caption: Caption) -> dict[str, Any]:
     """only forward the necessary fields"""
     return {
@@ -77,33 +68,41 @@ def caption_to_dict(caption: Caption) -> dict[str, Any]:
         "text": caption.text,
     }
 
-
+#  Drop finals older than the 90-second recovery window and prune their 
+#  corresponding revision state. 
 def trim_finals_log(now: float) -> None:
-    """Drop finals older than the history window, and their segment state"""
     pruned_seg = 0
+    # while finals_log is not empty and the oldest finalised caption is more than 90 seconds
     while finals_log and finals_log[0].source_ts < now - HISTORY_KEEP_SECONDS:
         pruned_seg = max(pruned_seg, finals_log.popleft().segment)
     if pruned_seg:
+        # Remove the oldest caption from the left side of the deque 
         rsm.prune(pruned_seg)
 
-
+# Overall, is in charge of calculating how quickly the caption source 
+# is sending updates.
 def stream_rate(now: float) -> float:
     while update_times and update_times[0] < now - STREAM_WINDOW:
         update_times.popleft()
     return len(update_times) / STREAM_WINDOW
 
-
+# In short, it handles a new provisional caption from the original source
+# and distributes the latest version to every client.
 def on_draft(caption: Caption) -> None:
     global active
     active = caption
+    # Stores the newest draft globally; as a segment can only receive multiple revision, 
+    # one should note only the last matters 
     for state in clients.values():
+        # Updates every connected browser client by itself.
         if state.pending_active is not None:
-            # The previous draft was never sent and is now obsolete.
             state.drafts_dropped += 1
+        # If a previous draft was waiting to be sent, it is now obsolete since a newer draft arrived.
         state.pending_active = caption
+        # Replaces the client's draft with the newest one.
         state.wake.set()
 
-
+# 
 def on_final(caption: Caption) -> None:
     global active
     trim_finals_log(caption.source_ts)
@@ -118,13 +117,11 @@ def on_final(caption: Caption) -> None:
             state.pending_active = None
         state.wake.set()
 
-
 def log_mode(state: ClientState, now: float) -> None:
     """Print the client's flow-control state whenever it changes."""
     old = state.flow.update_mode(now, stream_rate(now))
     if old is not None:
         print(f"client {state.client_id}: {old.name} -> {state.flow.mode.name}", flush=True)
-
 
 def on_pong(state: ClientState, fut: asyncio.Future) -> None:
     if fut.cancelled() or fut.exception() is not None:
@@ -133,7 +130,6 @@ def on_pong(state: ClientState, fut: asyncio.Future) -> None:
     state.flow.on_pong(now, stream_rate(now))
     log_mode(state, now)
     state.wake.set()  # re-check a held draft
-
 
 async def client_sender(state: ClientState) -> None:
     """Per-client sender: every final in order, then only the newest draft.
@@ -179,7 +175,6 @@ async def client_sender(state: ClientState) -> None:
     except websockets.ConnectionClosed:
         pass  # handle_client's finally does the cleanup
 
-
 async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
     global rsm
     session = hello.get("session")
@@ -224,12 +219,10 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
     finally:
         print("source disconnected", flush=True)
 
-
 def history_items(last_segment: int, history_seconds: float, now: float) -> list[Caption]:
     cutoff = now - history_seconds
     return [c for c in finals_log
             if c.segment > last_segment and c.source_ts >= cutoff]
-
 
 async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
     client_id = hello.get("client_id")
@@ -275,7 +268,6 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
               f"drafts_dropped={state.drafts_dropped}; "
               f"clients={len(clients)}", flush=True)
 
-
 async def handler(ws) -> None:
     try:
         raw = await asyncio.wait_for(ws.recv(), timeout=5)
@@ -292,7 +284,6 @@ async def handler(ws) -> None:
     else:
         await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
 
-
 async def main_async(port: int) -> None:
     async with websockets.serve(
         handler,
@@ -305,7 +296,6 @@ async def main_async(port: int) -> None:
         print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
         await asyncio.Future()
 
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
@@ -314,7 +304,6 @@ def main() -> None:
         asyncio.run(main_async(args.port))
     except KeyboardInterrupt:
         pass
-
 
 if __name__ == "__main__":
     main()
