@@ -16,6 +16,8 @@ from delivery_policy import DeliveryPolicy, NoFlowControl, empty_finals
 
 from enum import Enum
 
+# Technically this class is not needed but its here so that we can easily swap out
+# the old flow control code with the new one if necessary
 class FlowControlManager:
     """Construct independent client policies without shared rate estimates."""
 
@@ -37,27 +39,64 @@ class FlowControlManager:
 class ClientStatus(Enum):
     NORMAL = 1       # Permit drafts as well as finals.
     BEHIND = 2       # Hold drafts after sustained delay; check for recovery.
-    FINALS_ONLY = 3  # Keep drafts held until recovery and the retry deadline.
+    FINALS_ONLY = 3  # Hold drafts until recovery and the draft-retry wait has elapsed.
     REPROBING = 4    # Resume drafts temporarily to check delivery under load.
 
-# Experimental timings; validate them against caption freshness and coverage.
-PROBE_INTERVAL = 0.1  # Minimum time between the starts of custom pings.
-PROBE_CADENCE = 0.5   # Monitor waits this long after processing a pong to retry.
-DELAY_AFTER = 2.0     # Delay must persist this long; also the delivery-age limit.
-RECOVERY_AFTER = 3.0  # Healthy completed responses must span this long.
-TRIAL_AFTER = 5.0     # Required healthy-response span and active traffic time.
-INITIAL_RETRY = 5.0   # Initial wait before trying drafts from FINALS_ONLY.
-MAX_RETRY = 30.0      # Maximum wait after repeatedly unsuccessful trials.
+# Tuning parameters: all durations are seconds. Defaults are experimental;
+# compare caption freshness, final coverage, and state changes when tuning.
+
+# RTT calibration. Estimates remain fixed after this initial sample set.
+RTT_CALIBRATION_SAMPLES = 8  # More samples delay calibration; fewer are noisier.
+RTT_SAMPLE_HISTORY = 32     # Inspection buffer; keep >= RTT_CALIBRATION_SAMPLES.
+RTT_BASELINE_QUANTILE = 0.25  # Must be in (0, 1]; lower selects a lower baseline.
+
+# RTT sensitivity: smaller allowances classify more probes as late.
+RTT_MIN_ALLOWANCE = 0.150      # Floor for tolerance of transient delay.
+RTT_BASELINE_ALLOWANCE = 0.5   # Multiplier applied to baseline RTT.
+RTT_JITTER_ALLOWANCE = 4.0     # Multiplier applied to calibration jitter.
+
+# Draft withholding: lower times react sooner, but tolerate fewer brief spikes.
+LATE_PROBES_REQUIRED = 2       # Minimum consecutive late completed probes.
+LATE_PROBE_SPAN = 2.0          # Required time between first/latest late completions.
+PROBE_OVERDUE_AFTER = 2.0      # Time beyond a pending ping's RTT threshold.
+FINAL_AGE_LIMIT = 2.0          # Oldest final's time since per-client enqueue.
+SEND_DURATION_LIMIT = 2.0      # Maximum send duration before delivery pressure.
+BEHIND_ESCALATE_AFTER = 2.0    # Time in BEHIND before ongoing delay escalates.
+
+# Probe scheduling and observation freshness.
+PROBE_INTERVAL = 0.1          # Minimum spacing between custom ping starts.
+PROBE_CADENCE = 0.5           # Wait after processing a pong before another ping.
+MONITOR_INTERVAL = 0.05       # Check frequency; smaller values increase CPU work.
+PROBE_TIMEOUT = 20.0          # Close if a probe doesn't complete within this time.
+RTT_FRESHNESS_MIN = 1.0       # Freshness limit is max(this, RTT limit + cadence).
+
+# Recovery: smaller requirements resume drafts sooner, with less evidence.
+RECOVERY_AFTER = 3.0          # Required span of healthy completed responses.
+RECOVERY_PROBES_REQUIRED = 3
+
+# Trial is another name for Reprobe, reprobe probe sounds weird
+TRIAL_AFTER = 5.0             # Required healthy-response span during a draft trial.
+TRIAL_SOURCE_ACTIVE_TIME_REQUIRED = 5.0  # Accumulated source activity during the trial.
+TRIAL_PROBES_REQUIRED = 5
+TRIAL_SOURCE_UPDATES_REQUIRED = 10    # Accepted source updates; at least one must be a draft.
+TRIAL_UPDATE_GAP_CAP = 1.0     # Maximum activity time credited per update gap.
+TRIAL_SOURCE_IDLE_AFTER = 2.0  # Longer gaps reset health; latest update must be this recent.
+
+# Retry backoff: smaller waits retry drafts sooner after restriction/failure.
+INITIAL_RETRY = 5.0
+MAX_RETRY = 30.0
+RETRY_BACKOFF_MULTIPLIER = 2.0
 
 class FlowControl:
     """Store measurements and choose a mode without sending or awaiting data."""
 
     def __init__(self):
-        # The first eight valid samples establish these estimates. This version
+        # The initial calibration samples establish these estimates. This version
         # keeps them fixed afterward; later samples remain available for inspection.
-        self.rtt_samples = deque(maxlen=32)  # Most recent completed RTT values.
+        self.rtt_samples = deque(maxlen=RTT_SAMPLE_HISTORY)  # Recent completed RTTs.
         self.baseline = None  # Estimated normal RTT, or None while learning.
         self.jitter = None  # Typical distance of initial RTTs from their median.
+        self.rtt_threshold = None  # Learned RTT limit, or None during calibration.
 
         # Current probe
         self.probe_started_t: float | None = None  # Current ping operation's start.
@@ -68,9 +107,10 @@ class FlowControl:
         self.last_rtt = None  # Latest library-measured RTT duration.
         self.last_rtt_t = None  # When the monitor processed that result.
         self.late_since = None  # First late completion since the last healthy one.
-        self.last_late_t = None  # Latest late completion in that sequence.
-        self.late_count = 0  # Consecutive completed responses above their limits.
-        self.healthy_since = None  # First healthy response in the current sequence.
+        self.last_late_t = None  # Oldest late completion in a sequence of lates.
+        self.late_count = 0  # Consecutive pongs which were outdated.
+
+        self.healthy_since = None  # First healthy response in the current sequence of healthys.
         self.healthy_count = 0  # Healthy completions since the sequence was reset.
         self.last_rtt_late = None  # None until a post-calibration result is judged.
 
@@ -78,7 +118,7 @@ class FlowControl:
         self.mode = ClientStatus.NORMAL  # Current permission to send drafts.
         self.mode_since = None  # When the latest mode change occurred.
         self.retry_t = None  # Earliest time FINALS_ONLY can try drafts again.
-        self.retry_delay = INITIAL_RETRY  # Wait to use when setting that deadline.
+        self.retry_delay = INITIAL_RETRY  # Seconds to wait before another draft trial.
         self.delivery_pressure = False  # Remember detected waiting/blocked delivery.
         self.trial_updates = 0  # Accepted source updates during REPROBING.
         self.trial_has_draft = False  # Whether any of those updates was a draft.
@@ -107,16 +147,10 @@ class FlowControl:
         self.probe_started_t = now
         self.last_probe_t = now
 
-        if self.baseline is None:
-            # No learned normal RTT yet, so do not judge this ping as late.
-            self.probe_threshold = None
-        else:
-            self.probe_threshold = self.baseline + max(
-                0.150,                  # At least 150ms of allowance
-                0.5 * self.baseline,    # More allowance for higher-latency spikes
-                4 * self.jitter,        # Allow for normal RTT variation
-            )
+        # None during calibration; otherwise snapshot the learned RTT limit.
+        self.probe_threshold = self.rtt_threshold
 
+    # Use RTT value to calculate 
     def on_rtt(self, now : float, rtt : float) -> None:
         """Learn initial RTT or record a healthy/late result; do not change mode."""
 
@@ -129,7 +163,7 @@ class FlowControl:
         # A new response after a long observation gap cannot extend an old
         # healthy streak. In particular, monitor stalls must not prove recovery.
         if (threshold is not None and self.last_rtt_t is not None
-                and now - self.last_rtt_t > max(1.0, threshold + PROBE_CADENCE)):
+                and now - self.last_rtt_t > max(RTT_FRESHNESS_MIN, threshold + PROBE_CADENCE)):
             self._clear_healthy()
 
         self.probe_started_t = None
@@ -139,13 +173,15 @@ class FlowControl:
         self.rtt_samples.append(rtt)
 
         # Learn normal delay without rejecting higher RTTs.
+        # NOTE: this is only done for the initial calibration sample set;
+        # if the client starts off lagging, the baseline will remain
+        # inflated for the rest of the client lifespan
         if self.baseline is None:
-            if len(self.rtt_samples) >= 8:
+            if len(self.rtt_samples) >= RTT_CALIBRATION_SAMPLES:
                 samples = sorted(self.rtt_samples)  # Low RTTs first.
 
-                # Lower quartile: choose the value a quarter of the way through
-                # the sorted samples, reducing the influence of high spikes.
-                index = ceil(0.25 * len(samples)) - 1
+                # Choose a low quantile to reduce the influence of high spikes.
+                index = ceil(RTT_BASELINE_QUANTILE * len(samples)) - 1
                 self.baseline = samples[index]
 
                 # Median absolute deviation: find each sample's distance from
@@ -153,6 +189,11 @@ class FlowControl:
                 middle = median(samples)
                 self.jitter = median(
                     abs(sample - middle) for sample in samples
+                )
+                self.rtt_threshold = self.baseline + max(
+                    RTT_MIN_ALLOWANCE,
+                    RTT_BASELINE_ALLOWANCE * self.baseline,
+                    RTT_JITTER_ALLOWANCE * self.jitter,
                 )
 
             # Initial learning samples do not count toward sustained late delay.
@@ -184,19 +225,22 @@ class FlowControl:
                 self.healthy_since = now
 
             self.healthy_count += 1
-        # tick() evaluates these observations together with queue waiting times.
+        # tick() from monitor will use these measurements together with queue waiting times.
 
-
+    # Notes down whether the source is actively sending segments
+    # If the source is idling, we shouldn't count the healthy probes
+    # (Cuz if the server -> client latency is good while source idle, 
+    # that likely means no captions are being sent)
     def record_update(self, now: float, final: bool) -> None:
         """Count accepted source updates while testing resumed draft delivery."""
         if self.mode is not ClientStatus.REPROBING:
             return
         if self.trial_last_update is not None:
             gap = now - self.trial_last_update  # Time between source updates.
-            # Count at most one second per gap so a long idle period contributes
+            # Cap time credited per gap so a long idle period contributes
             # only limited time, rather than making an idle trial look successful.
-            self.trial_active_time += min(max(gap, 0.0), 1.0)
-            if gap > 2.0:
+            self.trial_active_time += min(max(gap, 0.0), TRIAL_UPDATE_GAP_CAP)
+            if gap > TRIAL_SOURCE_IDLE_AFTER:
                 # Require new healthy observations after a source interruption.
                 self._clear_healthy()
         self.trial_last_update = now
@@ -208,6 +252,8 @@ class FlowControl:
         self.healthy_since = None
         self.healthy_count = 0
 
+    # Takes measurements from on_RTT, then performs more calculations to gauge connection state
+    # using those calculations assign a state to the client
     def tick(self, now: float, pending_count: int, oldest_final_age: float,
              current_send_duration: float = 0.0) -> bool:
         """Calculate conditions, then return whether _advance_mode changes mode.
@@ -218,46 +264,53 @@ class FlowControl:
         zero means no send is active. All durations are in seconds.
         Hard limits and connection closure are handled outside this method.
         """
-        # Require multiple late completions spanning two seconds. Repeated tick
+
+        # 1. SUSTAINED DELAY
+        # Require consecutive late completions spanning LATE_PROBE_SPAN. Repeated tick
         # calls cannot turn two closely spaced old results into sustained delay.
         completed_delay = (
-            self.late_count >= 2
+            self.late_count >= LATE_PROBES_REQUIRED
             # There must be a delay between the oldest late probe and the most recent late probe
-            and self.last_late_t - self.late_since >= DELAY_AFTER
+            and self.last_late_t - self.late_since >= LATE_PROBE_SPAN
         )
+
+        # 2. OVERDUE FOR
+        # How long has the current ping waited for its pong (past its expected time, i.e. the threshold) 
         overdue_for = 0.0  # Seconds beyond the outstanding ping's saved limit.
         if self.probe_started_t is not None and self.probe_threshold is not None:
             overdue_for = max(
                 0.0, now - self.probe_started_t - self.probe_threshold
             )
 
+        # 3. DELIVER PRESSURE
         # Detect an old final or a long send, then remember that problem until
         # all finals drain and no send is active. One sent final is not enough.
-        if oldest_final_age >= DELAY_AFTER or current_send_duration >= DELAY_AFTER:
+        if oldest_final_age >= FINAL_AGE_LIMIT or current_send_duration >= SEND_DURATION_LIMIT:
             self.delivery_pressure = True
         elif pending_count == 0 and current_send_duration == 0.0:
             self.delivery_pressure = False
-            
+
+        # If we have evidence of a slowing connection, reset the "healthy sequence"
         # Healthy samples collected before current trouble cannot prove recovery.
         if self.delivery_pressure or overdue_for > 0.0:
             self._clear_healthy()
 
         # troubled means enough sustained delay or waiting work to hold drafts.
         troubled = (
-            completed_delay or overdue_for >= DELAY_AFTER or self.delivery_pressure
+            completed_delay or overdue_for >= PROBE_OVERDUE_AFTER or self.delivery_pressure
         )
-        # A late result or overdue ping is current delay, even before it has
+
+        # A late result or overdue ping means delay_present, even before it has
         # lasted long enough to establish sustained trouble.
         delay_present = self.last_rtt_late is True or overdue_for > 0.0
 
         # Do not use an old healthy response to declare recovery now. Allow at
-        # least one second of sample age, or longer for a higher-latency path.
+        # least RTT_FRESHNESS_MIN of sample age, or longer for a higher-latency path.
         fresh = (
             self.last_rtt_t is not None
-            and self.baseline is not None
+            and self.rtt_threshold is not None
             and now - self.last_rtt_t <= max(
-                1.0, self.baseline + max(0.150, 0.5 * self.baseline, 4 * self.jitter)
-                + PROBE_CADENCE
+                RTT_FRESHNESS_MIN, self.rtt_threshold + PROBE_CADENCE
             )
         )
         healthy = (
@@ -270,19 +323,19 @@ class FlowControl:
         )
         recovered = (
             # Count actual completions and their time span, not time spent ticking.
-            healthy and self.healthy_count >= 3
+            healthy and self.healthy_count >= RECOVERY_PROBES_REQUIRED
             and self.last_rtt_t - self.healthy_since >= RECOVERY_AFTER
         )
         trial_complete = (
             # Test full delivery with healthy pongs AND actual source traffic.
             # This is evidence during a finite trial, not proof of client capacity.
             healthy and self.mode is ClientStatus.REPROBING
-            and self.healthy_count >= 5
+            and self.healthy_count >= TRIAL_PROBES_REQUIRED
             and self.last_rtt_t - self.healthy_since >= TRIAL_AFTER
-            and self.trial_active_time >= TRIAL_AFTER
-            and self.trial_updates >= 10 and self.trial_has_draft
+            and self.trial_active_time >= TRIAL_SOURCE_ACTIVE_TIME_REQUIRED
+            and self.trial_updates >= TRIAL_SOURCE_UPDATES_REQUIRED and self.trial_has_draft
             and self.trial_last_update is not None
-            and now - self.trial_last_update <= 2.0
+            and now - self.trial_last_update <= TRIAL_SOURCE_IDLE_AFTER
         )
         return self._advance_mode(
             now, troubled, delay_present, recovered, trial_complete
@@ -302,24 +355,24 @@ class FlowControl:
 
         elif old is ClientStatus.BEHIND:
             # Continuing trouble gets a longer restriction. If healthy responses
-            # are accumulating instead, let the three-second recovery finish.
+            # are accumulating instead, let the healthy recovery span finish.
             if troubled or delay_present:
-                if now - self.mode_since >= DELAY_AFTER:
+                if now - self.mode_since >= BEHIND_ESCALATE_AFTER:
                     self.mode = ClientStatus.FINALS_ONLY
                     self.retry_t = now + self.retry_delay
             elif recovered:
                 self.mode = ClientStatus.REPROBING
 
         elif old is ClientStatus.FINALS_ONLY:
-            # The retry deadline alone cannot resume drafts without recovery.
+            # Elapsing the draft-retry wait alone cannot resume drafts without recovery.
             if not troubled and recovered and now >= self.retry_t:
                 self.mode = ClientStatus.REPROBING
-                
+
         elif old is ClientStatus.REPROBING:
             if troubled:
                 # A failed trial increases the next wait, up to the configured cap.
                 self.mode = ClientStatus.FINALS_ONLY
-                self.retry_delay = min(MAX_RETRY, 2 * self.retry_delay)
+                self.retry_delay = min(MAX_RETRY, RETRY_BACKOFF_MULTIPLIER * self.retry_delay)
                 self.retry_t = now + self.retry_delay
             elif not delay_present and trial_complete:
                 # Successful full delivery resets the increasing retry wait.
@@ -390,10 +443,11 @@ class PingFlowControl:
             await asyncio.gather(self._monitor_task, return_exceptions=True)
 
     async def measure_ping(self):
-        """Return library-measured RTT, without timing the earlier caption send.
+        """Return library-measured gauge of RTT, without including any 
+        caption send or ping-call setup time (which would occur if time b4 ws.ping).
 
         Buffered data can still increase RTT. A pong does not prove that the
-        browser applied a caption. Sending the ping itself can also block.
+        browser applied a caption. Sending the ping itself can also block, inflating RTT.
         """
         pong_future = await self.ws.ping()
         # Shield prevents cancellation of this task from cancelling
@@ -405,8 +459,8 @@ class PingFlowControl:
         return await asyncio.shield(pong_future)
 
     async def client_monitor(self):
-        """Check delivery and ping deadlines while the caption sender can wait."""
-        probe_task = None  # Separate task sends a ping and awaits its result.
+        """Monitor delivery pressure and ping timing concurrently with the sender."""
+        probe_task = None  # Task sends a ping and awaits its result.
         probe_started = None  # Includes time waiting for ping transmission.
         next_probe = monotonic()  # Earliest scheduled start of another ping.
 
@@ -414,19 +468,21 @@ class PingFlowControl:
             while not self._closed:
                 now = monotonic()  # One consistent time for this iteration's checks.
 
-                # Read a completed result before evaluating deadlines.
+                # Read a completed result before checking the probe completion timeout.
                 if probe_task is not None and probe_task.done():
                     rtt = probe_task.result()  # Duration in seconds; may raise ConnectionClosed.
+
                     self.controller.on_rtt(now, rtt)
                     probe_task = None
                     probe_started = None
                     next_probe = now + PROBE_CADENCE
 
-                # Close after 20 seconds without completion, including a blocked
+                # Close websocket after PROBE_TIMEOUT without completion, including a blocked
                 # ping send. This also applies before baseline learning finishes.
+                # Forces reconnection
                 if (
                     probe_started is not None
-                    and now - probe_started >= 20.0
+                    and now - probe_started >= PROBE_TIMEOUT
                 ):
                     await self.ws.close(
                         code=1013,
@@ -437,7 +493,7 @@ class PingFlowControl:
                 pending, inflight = self.get_finals()
                 # inflight is the final currently inside ws.send(), not a final
                 # waiting for application acknowledgement from the client.
-                # With one sender and a FIFO queue, the sending final is oldest.
+                # With one sender and a FIFO queue, the "nearest to be sent" final is oldest.
                 if inflight is not None:
                     oldest = inflight
                 elif pending:
@@ -469,18 +525,20 @@ class PingFlowControl:
                           flush=True)
                     self.wake.set()  # Sender rechecks draft permission.
 
+                # Send out probe, asynchronously
                 if (probe_task is None and now >= next_probe
                         and self.controller.should_probe(now)):
                     # Store the start before creating the task. Do not await the
-                    # ping here: the monitor must keep checking other deadlines.
+                    # ping here: the monitor must keep checking final age,
+                    # send duration, overdue pings, and draft-retry eligibility.
                     probe_started = now
                     self.controller.on_probe(now)
                     probe_task = asyncio.create_task(
                         self.measure_ping()
                     )
 
-                # Yield to other tasks; check again within about 50 ms.
-                await asyncio.sleep(0.05)
+                # Yield to other tasks before the next monitoring iteration.
+                await asyncio.sleep(MONITOR_INTERVAL)
 
         except websockets.ConnectionClosed:
             return

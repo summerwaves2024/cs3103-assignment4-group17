@@ -126,8 +126,9 @@ async def client_sender(state: BaseClientState) -> None:
         while True:
             await state.wake.wait()
             state.wake.clear()
+
             while state.pending_finals or state.pending_active is not None:
-                # send unsent finals first (from oldest to newest)
+                # send unsent finals first (from oldest to newest
                 if state.pending_finals:
                     caption = state.pending_finals.popleft()
                     state.inflight_final = caption
@@ -146,15 +147,23 @@ async def client_sender(state: BaseClientState) -> None:
                         continue
                     caption = state.pending_active
                     state.pending_active = None
+
                 try:
                     state.send_started_t = time.monotonic()
+
+                    # Send a caption
                     await state.ws.send(json.dumps(caption_to_dict(caption)))
                     if caption.final:
                         state.last_final = (caption.segment, caption.revision)
                 finally:
                     state.inflight_final = None
                     state.send_started_t = None
+
+                # Update delivery state
                 await state.after_send()
+
+                # Yield to other runnable tasks (like ping flow control)
+                await asyncio.sleep(0)
     except websockets.ConnectionClosed:
         pass  # handle_client's finally does the cleanup
 
