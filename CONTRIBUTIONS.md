@@ -1,49 +1,12 @@
-# Contributions
+# Team Contributions
 
-## Team members
+| Member | Main responsibilities | Experiments/report sections | Agreed contribution % |
+|---|---|---|---:|
+| Member 1 | Lim Jinle, Alexius |  |  |
+| Member 2 | Ong Li Min |  |  |
+| Member 3 | James China Jia Jun |  |  |
+| Member 4 | Tey Kai Jie |  |  |
 
-| Member | Matriculation number | Contribution |
-|---|---|---:|
-| <Name> | <Matric number> | <percentage>% |
-| <Name> | <Matric number> | <percentage>% |
-| <Name> | <Matric number> | <percentage>% |
-| <Name> | <Matric number> | <percentage>% |
+Total contribution should be 100%.
 
-The contribution percentages should add up to 100%.
-
-## Responsibilities
-
-### Ong Li Min
-
-- <Responsibility>
-- <Responsibility>
-
-### <Name>
-
-- <Responsibility>
-- <Responsibility>
-
-### <Name>
-
-- <Responsibility>
-- <Responsibility>
-
-### <Name>
-
-- <Responsibility>
-- <Responsibility>
-
-## Components and experiments
-
-- Server protocol and WebSocket handling: <member>
-- Revision and deduplication logic: <member>
-- History and reconnect recovery: <member>
-- Flow control and slow-client testing: <member>
-- Browser UI and deterministic demo: <member>
-- Public-test experiments and analysis: <member>
-- Technical report: <member>
-- Demo video: <member>
-
-## Agreement
-
-The team agrees that the responsibilities and percentages listed above accurately represent each member's contribution.
+Add brief notes on major shared/integration work if useful. Git history is supporting evidence, not a substitute for this statement.
