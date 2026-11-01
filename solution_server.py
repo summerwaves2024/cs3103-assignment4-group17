@@ -230,8 +230,14 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
                 is_accepted, _ = rsm.process_caption(caption)
                 if not is_accepted:
                     continue
-                # Records the accepted update for calculating the source stream rate.
-                update_times.append(time.monotonic())
+                now = time.monotonic()
+
+                # Prune update_times so that the flow calculation remains
+                # bounded even if no clients are connected.
+                stream_rate(now)
+
+                update_times.append(now)
+
                 if caption.final:
                     on_final(caption)
                 else:
