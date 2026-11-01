@@ -76,11 +76,11 @@ RECOVERY_PROBES_REQUIRED = 3
 
 # Trial is another name for Reprobe, reprobe probe sounds weird
 TRIAL_AFTER = 5.0             # Required healthy-response span during a draft trial.
-TRIAL_SOURCE_ACTIVE_TIME_REQUIRED = 5.0  # Accumulated source activity during the trial.
+TRIAL_SEND_ACTIVE_TIME_REQUIRED = 5.0  # Accumulated caption-send activity during the trial.
 TRIAL_PROBES_REQUIRED = 5
-TRIAL_SOURCE_UPDATES_REQUIRED = 10    # Accepted source updates; at least one must be a draft.
-TRIAL_UPDATE_GAP_CAP = 1.0     # Maximum activity time credited per update gap.
-TRIAL_SOURCE_IDLE_AFTER = 2.0  # Longer gaps reset health; latest update must be this recent.
+TRIAL_SENDS_REQUIRED = 10     # Completed caption sends; finals and drafts both count.
+TRIAL_SEND_GAP_CAP = 1.0      # Maximum activity time credited per gap between sends.
+TRIAL_SEND_IDLE_AFTER = 2.0   # Longer send gaps require new healthy observations.
 
 # Retry backoff: smaller waits retry drafts sooner after restriction/failure.
 INITIAL_RETRY = 5.0
@@ -120,10 +120,10 @@ class FlowControl:
         self.retry_t = None  # Earliest time FINALS_ONLY can try drafts again.
         self.retry_delay = INITIAL_RETRY  # Seconds to wait before another draft trial.
         self.delivery_pressure = False  # Remember detected waiting/blocked delivery.
-        self.trial_updates = 0  # Accepted source updates during REPROBING.
-        self.trial_has_draft = False  # Whether any of those updates was a draft.
-        self.trial_active_time = 0.0  # Time accumulated between source updates.
-        self.trial_last_update = None  # Latest source-update time during the trial.
+        self.trial_sends = 0  # Completed caption sends during REPROBING.
+        self.trial_active_time = 0.0  # Capped time accumulated between caption sends.
+        self.trial_last_send = None  # Latest completed caption-send time in the trial.
+        self.trial_traffic_ready_t = None  # When sufficient trial traffic was first sent.
 
     def draft_delay(self) -> float | None:
         """Allow drafts now, or hold them until the monitor wakes the sender."""
@@ -227,25 +227,30 @@ class FlowControl:
             self.healthy_count += 1
         # tick() from monitor will use these measurements together with queue waiting times.
 
-    # Notes down whether the source is actively sending segments
-    # If the source is idling, we shouldn't count the healthy probes
-    # (Cuz if the server -> client latency is good while source idle, 
-    # that likely means no captions are being sent)
-    def record_update(self, now: float, final: bool) -> None:
-        """Count accepted source updates while testing resumed draft delivery."""
+    # This function is for recovery during the REPROBE (or trial phase)
+    def record_send(self, now: float) -> None:
+        """Count completed caption sends while testing resumed delivery.
+
+        A completed send isn't an application acknowledgement. Healthy pongs
+        and the delivery-pressure checks must also support trial success.
+        """
         if self.mode is not ClientStatus.REPROBING:
             return
-        if self.trial_last_update is not None:
-            gap = now - self.trial_last_update  # Time between source updates.
+        if self.trial_last_send is not None:
+            gap = now - self.trial_last_send
             # Cap time credited per gap so a long idle period contributes
             # only limited time, rather than making an idle trial look successful.
-            self.trial_active_time += min(max(gap, 0.0), TRIAL_UPDATE_GAP_CAP)
-            if gap > TRIAL_SOURCE_IDLE_AFTER:
-                # Require new healthy observations after a source interruption.
+            self.trial_active_time += min(max(gap, 0.0), TRIAL_SEND_GAP_CAP)
+            if gap > TRIAL_SEND_IDLE_AFTER:
+                # Old healthy observations cannot validate newly resumed traffic.
                 self._clear_healthy()
-        self.trial_last_update = now
-        self.trial_updates += 1
-        self.trial_has_draft |= not final
+                self.trial_traffic_ready_t = None
+        self.trial_last_send = now
+        self.trial_sends += 1
+        if (self.trial_traffic_ready_t is None
+                and self.trial_sends >= TRIAL_SENDS_REQUIRED
+                and self.trial_active_time >= TRIAL_SEND_ACTIVE_TIME_REQUIRED):
+            self.trial_traffic_ready_t = now
 
     def _clear_healthy(self) -> None:
         """Forget the healthy response sequence so recovery needs new samples."""
@@ -327,15 +332,20 @@ class FlowControl:
             and self.last_rtt_t - self.healthy_since >= RECOVERY_AFTER
         )
         trial_complete = (
-            # Test full delivery with healthy pongs AND actual source traffic.
+            # Test resumed delivery with healthy pongs AND completed caption sends.
             # This is evidence during a finite trial, not proof of client capacity.
             healthy and self.mode is ClientStatus.REPROBING
             and self.healthy_count >= TRIAL_PROBES_REQUIRED
             and self.last_rtt_t - self.healthy_since >= TRIAL_AFTER
-            and self.trial_active_time >= TRIAL_SOURCE_ACTIVE_TIME_REQUIRED
-            and self.trial_updates >= TRIAL_SOURCE_UPDATES_REQUIRED and self.trial_has_draft
-            and self.trial_last_update is not None
-            and now - self.trial_last_update <= TRIAL_SOURCE_IDLE_AFTER
+            and self.trial_active_time >= TRIAL_SEND_ACTIVE_TIME_REQUIRED
+            and self.trial_sends >= TRIAL_SENDS_REQUIRED
+            and self.trial_last_send is not None
+            # Require a healthy pong from a ping started after sufficient trial
+            # traffic was sent. Later sends needn't stop for the trial to pass,
+            # and no new sends are required once that traffic has drained.
+            and self.trial_traffic_ready_t is not None
+            and self.last_probe_t is not None
+            and self.last_probe_t >= self.trial_traffic_ready_t
         )
         return self._advance_mode(
             now, troubled, delay_present, recovered, trial_complete
@@ -387,10 +397,10 @@ class FlowControl:
         # trial under the new mode's different amount of caption traffic.
         self._clear_healthy()
         if self.mode is ClientStatus.REPROBING:
-            self.trial_updates = 0
-            self.trial_has_draft = False
+            self.trial_sends = 0
             self.trial_active_time = 0.0
-            self.trial_last_update = None
+            self.trial_last_send = None
+            self.trial_traffic_ready_t = None
         return True
 
 class PingFlowControl:
@@ -417,13 +427,12 @@ class PingFlowControl:
         return self.controller.draft_delay()
 
     async def after_send(self) -> None:
-        """Keep the shared sender hook; this version probes independently."""
-        # Probing belongs to the monitor, not the caption sender.
-        pass
+        """Record a completed caption send; probing remains in the monitor."""
+        self.controller.record_send(monotonic())
 
     def record_update(self, now: float, final: bool) -> None:
-        """Forward source activity even when this client did not receive it."""
-        self.controller.record_update(now, final)
+        """Keep interface compatibility; incoming updates don't validate a trial."""
+        pass
 
     def start(self) -> None:
         """Schedule one monitor after the client state is fully constructed."""

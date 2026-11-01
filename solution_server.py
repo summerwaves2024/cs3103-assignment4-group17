@@ -159,7 +159,7 @@ async def client_sender(state: BaseClientState) -> None:
                     state.inflight_final = None
                     state.send_started_t = None
 
-                # Update delivery state
+                # Observe a completed caption send (final or draft) for flow control.
                 await state.after_send()
 
                 # Yield to other runnable tasks (like ping flow control)
@@ -196,11 +196,9 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
                     continue
 
                 now = time.monotonic()
-                # Managers may keep shared measurements; policies may track
-                # per-client recovery trials. Both receive accepted updates only.
+                # The legacy manager measures source rate. The newer policy
+                # validates recovery using completed sends in after_send().
                 flow_control.record_update(now, caption.final)
-                for state in clients.values():
-                    state.record_update(now, caption.final)
 
                 if caption.final:
                     on_final(caption)
@@ -314,7 +312,7 @@ async def main_async(port: int, flow_control_mode: str = "adaptive",
     global flow_control
     manager_type = FlowControlManager
     if flow_control_module is not None:
-        if flow_control_module not in ("flow_control", "flow_controlz"):
+        if flow_control_module not in ("flow_control", "flow_control_old"):
             raise ValueError("Unknown flow-control module")
         manager_type = import_module(flow_control_module).FlowControlManager
     flow_control = manager_type(enabled=flow_control_mode == "adaptive")
@@ -335,7 +333,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--flow-control", choices=("adaptive", "none"), default="adaptive",
                         help="Flow-control policy (default: adaptive)")
-    parser.add_argument("--flow-control-module", choices=("flow_control", "flow_controlz"),
+    parser.add_argument("--flow-control-module", choices=("flow_control", "flow_control_old"),
                         help="Implementation module (default: imported FlowControlManager)")
     args = parser.parse_args()
     try:

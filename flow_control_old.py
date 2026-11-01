@@ -171,6 +171,11 @@ class PingFlowControl:
         return self.controller.draft_delay(now, self.stream_rate(now))
 
     async def after_send(self) -> None:
+        """Count a completed caption send and optionally launch a legacy probe.
+
+        Keep the same no-argument hook as the newer send-based trial policy;
+        both finals and drafts count without extra metadata from the server.
+        """
         self.controller.on_send()
         now = monotonic()
         if not self._closed and self.controller.should_probe(now):
