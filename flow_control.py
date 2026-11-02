@@ -79,6 +79,13 @@ TRIAL_AFTER = 120.0           # Do not retry drafts during a 60-second lecture r
 TRIAL_PROBES_REQUIRED = 5
 TRIAL_SENDS_REQUIRED = 10     # Completed caption sends; finals and drafts both count.
 
+# Resume drafts in stages after overload. The final stage tests unrestricted
+# delivery before NORMAL; evidence from a slower stage cannot validate it.
+REPROBE_DRAFT_INTERVALS = (2.0, 0.5, 0.0)
+REPROBE_STAGE_AFTER = 1.0
+REPROBE_STAGE_PROBES_REQUIRED = 2
+REPROBE_STAGE_SENDS_REQUIRED = 2
+
 # Retry backoff: smaller waits retry drafts sooner after restriction/failure.
 INITIAL_RETRY = 120.0       # Do not retry drafts during a 60-second lecture run.
 MAX_RETRY = 120.0
@@ -119,16 +126,36 @@ class FlowControl:
         self.delivery_pressure = False  # Remember detected waiting/blocked delivery.
         self.trial_sends = 0  # Completed caption sends during REPROBING.
         self.trial_traffic_ready_t = None  # When sufficient trial traffic was first sent.
+        self.trial_stage = 0
+        self.trial_stage_started_t = None
+        self.trial_last_draft_t = None
 
-    def draft_delay(self) -> float | None:
-        """Allow drafts now, or hold them until the monitor wakes the sender."""
-        if self.mode in (
-            ClientStatus.NORMAL,
-            ClientStatus.REPROBING,
-        ):
-            return 0.0 # Send Drafts
+    def draft_delay(self, now: float | None = None) -> float | None:
+        """Admit a draft, or return the wait until another draft can be admitted.
 
-        return None # Send only Finals
+        The sender calls this only with a pending draft and no queued finals.
+        A zero return reserves one draft slot; finals never use this gate.
+        """
+        if self.mode is ClientStatus.NORMAL:
+            return 0.0
+        if self.mode is not ClientStatus.REPROBING:
+            return None
+        now = monotonic() if now is None else now
+        interval = REPROBE_DRAFT_INTERVALS[self.trial_stage]
+        if self.trial_last_draft_t is not None:
+            delay = self.trial_last_draft_t + interval - now
+            if delay > 0:
+                return delay
+        self.trial_last_draft_t = now
+        return 0.0
+
+    def _reset_trial_evidence(self, now: float) -> None:
+        self.trial_stage_started_t = now
+        self.trial_sends = 0
+        self.trial_active_time = 0.0
+        self.trial_last_send = None
+        self.trial_traffic_ready_t = None
+        self._clear_healthy()
 
     def should_probe(self, now : float) -> bool:
         """Permit only one outstanding ping and enforce minimum ping spacing."""
@@ -318,10 +345,12 @@ class FlowControl:
             healthy and self.healthy_count >= RECOVERY_PROBES_REQUIRED
             and self.last_rtt_t - self.healthy_since >= RECOVERY_AFTER
         )
+        full_trial = self.trial_stage == len(REPROBE_DRAFT_INTERVALS) - 1
         trial_complete = (
             # Test resumed delivery with healthy pongs AND completed caption sends.
             # This is evidence during a finite trial, not proof of client capacity.
             healthy and self.mode is ClientStatus.REPROBING
+            and full_trial
             and self.healthy_count >= TRIAL_PROBES_REQUIRED
             and self.last_rtt_t - self.healthy_since >= TRIAL_AFTER
             and self.trial_sends >= TRIAL_SENDS_REQUIRED
@@ -332,9 +361,19 @@ class FlowControl:
             and self.last_probe_t is not None
             and self.last_probe_t >= self.trial_traffic_ready_t
         )
-        return self._advance_mode(
+        changed = self._advance_mode(
             now, troubled, delay_present, recovered, trial_complete
         )
+        if (not changed and self.mode is ClientStatus.REPROBING
+                and not full_trial and not troubled and not delay_present
+                and healthy and self.trial_stage_started_t is not None
+                and now - self.trial_stage_started_t >= REPROBE_STAGE_AFTER
+                and self.healthy_count >= REPROBE_STAGE_PROBES_REQUIRED
+                and self.last_rtt_t - self.healthy_since >= REPROBE_STAGE_AFTER
+                and self.trial_sends >= REPROBE_STAGE_SENDS_REQUIRED):
+            self.trial_stage += 1
+            self._reset_trial_evidence(now)
+        return changed
 
     def _advance_mode(self, now: float, troubled: bool, delay_present: bool,
                       recovered: bool, trial_complete: bool) -> bool:
@@ -382,8 +421,9 @@ class FlowControl:
         # trial under the new mode's different amount of caption traffic.
         self._clear_healthy()
         if self.mode is ClientStatus.REPROBING:
-            self.trial_sends = 0
-            self.trial_traffic_ready_t = None
+            self.trial_stage = 0
+            self.trial_last_draft_t = None
+            self._reset_trial_evidence(now)
         return True
 
 class PressureFlowControl:
@@ -541,6 +581,7 @@ class PingFlowControl:
                     self.get_send_started() if self.get_send_started else None
                 )
                 old = self.controller.mode
+                old_stage = self.controller.trial_stage
                 # Include the sending final even though it has left the deque.
                 changed = self.controller.tick(
                     now,
@@ -555,6 +596,9 @@ class PingFlowControl:
                     print(f"client {self.client_id}: {old.name} -> {self.status}",
                           flush=True)
                     self.wake.set()  # Sender rechecks draft permission.
+                elif old_stage != self.controller.trial_stage:
+                    # A shorter pacing interval may release a held latest draft.
+                    self.wake.set()
 
                 # Send out probe, asynchronously
                 if (probe_task is None and now >= next_probe
