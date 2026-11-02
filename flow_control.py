@@ -76,11 +76,8 @@ RECOVERY_PROBES_REQUIRED = 3
 
 # Trial is another name for Reprobe, reprobe probe sounds weird
 TRIAL_AFTER = 5.0             # Required healthy-response span during a draft trial.
-TRIAL_SEND_ACTIVE_TIME_REQUIRED = 5.0  # Accumulated caption-send activity during the trial.
 TRIAL_PROBES_REQUIRED = 5
 TRIAL_SENDS_REQUIRED = 10     # Completed caption sends; finals and drafts both count.
-TRIAL_SEND_GAP_CAP = 1.0      # Maximum activity time credited per gap between sends.
-TRIAL_SEND_IDLE_AFTER = 2.0   # Longer send gaps require new healthy observations.
 
 # Retry backoff: smaller waits retry drafts sooner after restriction/failure.
 INITIAL_RETRY = 5.0
@@ -121,8 +118,6 @@ class FlowControl:
         self.retry_delay = INITIAL_RETRY  # Seconds to wait before another draft trial.
         self.delivery_pressure = False  # Remember detected waiting/blocked delivery.
         self.trial_sends = 0  # Completed caption sends during REPROBING.
-        self.trial_active_time = 0.0  # Capped time accumulated between caption sends.
-        self.trial_last_send = None  # Latest completed caption-send time in the trial.
         self.trial_traffic_ready_t = None  # When sufficient trial traffic was first sent.
 
     def draft_delay(self) -> float | None:
@@ -155,8 +150,9 @@ class FlowControl:
         """Learn initial RTT or record a healthy/late result; do not change mode."""
 
         # 1. Validate and record the RTT sample.
-        if not isfinite(rtt) or rtt <= 0:
-            raise ValueError("RTT must be positive and finite")
+        # A fast localhost pong can round to zero on coarse-resolution clocks.
+        if not isfinite(rtt) or rtt < 0:
+            raise ValueError("RTT must be nonnegative and finite")
 
         threshold = self.probe_threshold  # Use the limit saved for this ping.
 
@@ -236,22 +232,11 @@ class FlowControl:
         """
         if self.mode is not ClientStatus.REPROBING:
             return
-        if self.trial_last_send is not None:
-
-            # Roughly ga
-            gap = now - self.trial_last_send
-            # Cap time credited per gap so a long idle period contributes
-            # only limited time, rather than making an idle trial look successful.
-            self.trial_active_time += min(max(gap, 0.0), TRIAL_SEND_GAP_CAP)
-            if gap > TRIAL_SEND_IDLE_AFTER:
-                # Old healthy observations cannot validate newly resumed traffic.
-                self._clear_healthy()
-                self.trial_traffic_ready_t = None
-        self.trial_last_send = now
         self.trial_sends += 1
+        # Keep the first readiness time: sparse or continuous later sends must
+        # not restart the healthy-probe confirmation requirement.
         if (self.trial_traffic_ready_t is None
-                and self.trial_sends >= TRIAL_SENDS_REQUIRED
-                and self.trial_active_time >= TRIAL_SEND_ACTIVE_TIME_REQUIRED):
+                and self.trial_sends >= TRIAL_SENDS_REQUIRED):
             self.trial_traffic_ready_t = now
 
     def _clear_healthy(self) -> None:
@@ -339,9 +324,7 @@ class FlowControl:
             healthy and self.mode is ClientStatus.REPROBING
             and self.healthy_count >= TRIAL_PROBES_REQUIRED
             and self.last_rtt_t - self.healthy_since >= TRIAL_AFTER
-            and self.trial_active_time >= TRIAL_SEND_ACTIVE_TIME_REQUIRED
             and self.trial_sends >= TRIAL_SENDS_REQUIRED
-            and self.trial_last_send is not None
             # Require a healthy pong from a ping started after sufficient trial
             # traffic was sent. Later sends needn't stop for the trial to pass,
             # and no new sends are required once that traffic has drained.
@@ -400,8 +383,6 @@ class FlowControl:
         self._clear_healthy()
         if self.mode is ClientStatus.REPROBING:
             self.trial_sends = 0
-            self.trial_active_time = 0.0
-            self.trial_last_send = None
             self.trial_traffic_ready_t = None
         return True
 
