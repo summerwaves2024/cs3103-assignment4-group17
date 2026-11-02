@@ -30,13 +30,11 @@ HISTORY_KEEP_SECONDS = 90 # how long the server keeps finalised captions
 MAX_HISTORY_SECONDS = 60 # the maximum history a client can request
 DEFAULT_HISTORY_SECONDS = 30 # default/recall window when the client does not specify one
 MAX_PENDING_FINALS = 256  # maximum for per-client finalized-caption backlog
-FINAL_BATCH_THRESHOLD = 2
 
 
 
 finals_log: deque[Caption] = deque()  # finals in segment order, trimmed to HISTORY_KEEP_SECONDS
 active: Caption | None = None          # newest draft of the current segment
-source_done = False                    # source has emitted its final update
 clients: dict[ServerConnection, BaseClientState] = {} # keyed by socket
 overloaded_clients: set[ServerConnection] = set()
 rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO
@@ -91,12 +89,16 @@ def trim_finals_log(now: float) -> None:
 def on_draft(caption: Caption) -> None:
     global active
     active = caption
-    # Experimental final-completeness mode: provisional captions consume the
-    # same client read slots as finals, so do not compete with final delivery.
+    # Stores the newest draft globally; as a segment can only receive multiple revision,
+    # one should note only the last matters
     for state in clients.values():
+        # Updates every connected browser client by itself.
         if state.pending_active is not None:
             state.drafts_dropped += 1
-        state.pending_active = None
+        # If a previous draft was waiting to be sent, it is now obsolete since a newer draft arrived.
+        state.pending_active = caption
+        # Replaces the client's draft with the newest one.
+        state.wake.set()
 
 # This handles a finalised caption from the original source.
 def on_final(caption: Caption) -> None:
@@ -115,12 +117,17 @@ def on_final(caption: Caption) -> None:
         if state.ws in overloaded_clients:
             continue
         if len(state.pending_finals) >= MAX_PENDING_FINALS:
+            # Do not silently drop finalized captions. Close an excessively
+            # delayed client so it reconnects and recovers from finals_log.
             overloaded_clients.add(state.ws)
             state.pending_active = None
+            print(f"client too far behind: id={state.client_id}; "
+                  f"pending_finals={len(state.pending_finals)}", flush=True)
             asyncio.create_task(
                 state.ws.close(code=1013, reason="Client too far behind")
             )
             continue
+        # Queue timing belongs to each client, not the shared source caption.
         state.pending_finals.append(replace(caption, queue_ts=time.monotonic()))
         # The final supersedes any unsent draft of the same segment.
         if state.pending_active is not None and state.pending_active.segment == caption.segment:
@@ -130,10 +137,10 @@ def on_final(caption: Caption) -> None:
 
 
 async def client_sender(state: BaseClientState) -> None:
-    """Simple final-first sender for one client.
+    """Per-client sender: every final in order, then only the newest draft.
 
-    Final captions are never held behind drafts.  Drafts are replaceable and
-    are sent only when the finalized queue is empty.
+    This is the only place that awaits ws.send for this client, so a slow
+    client never blocks the source or the other clients.
     """
     try:
         while True:
@@ -144,45 +151,46 @@ async def client_sender(state: BaseClientState) -> None:
             while state.pending_finals or state.pending_active is not None:
                 # send unsent finals first (from oldest to newest)
                 if state.pending_finals:
-                    if source_done or len(state.pending_finals) >= FINAL_BATCH_THRESHOLD:
-                        batch = list(state.pending_finals)
-                        state.pending_finals.clear()
-                        caption = batch[-1]
-                        state.inflight_final = caption
-                        payload = json.dumps({
-                            "type": "HISTORY",
-                            "items": [caption_to_dict(c) for c in batch],
-                        })
-                    else:
-                        caption = state.pending_finals.popleft()
-                        state.inflight_final = caption
-                        payload = json.dumps(caption_to_dict(caption))
-                # If no finals remain, send the newest replaceable draft.
+                    caption = state.pending_finals.popleft()
+                    state.inflight_final = caption
+                # if no more finals left to send, send the actively changing one
                 else:
+                    delay = state.draft_delay()
+                    if delay is None or delay > 0:
+                        # Client is behind: hold the draft (a newer one may replace
+                        # it). Wait `delay` seconds, or with no timeout (None) until
+                        # woken by the pong, a new final or a new draft.
+                        try:
+                            await asyncio.wait_for(state.wake.wait(), delay)
+                        except asyncio.TimeoutError:
+                            pass
+                        state.wake.clear()
+                        continue
                     caption = state.pending_active
                     state.pending_active = None
-                    payload = json.dumps(caption_to_dict(caption))
 
                 try:
                     state.send_started_t = time.monotonic()
 
                     # Send a caption
-                    await state.ws.send(payload)
+                    await state.ws.send(json.dumps(caption_to_dict(caption)))
                     if caption.final:
                         state.last_final = (caption.segment, caption.revision)
                 finally:
                     state.inflight_final = None
                     state.send_started_t = None
 
-                # Yield so another client's sender can run.
+                # Observe a completed caption send (final or draft) for flow control.
+                await state.after_send()
+
+                # Yield to other runnable tasks (like ping flow control)
                 await asyncio.sleep(0)
     except websockets.ConnectionClosed:
         pass  # handle_client's finally does the cleanup
 
 # As a whole, it manages the connection from caption_source.py.
 async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
-    global rsm, source_done
-    source_done = False
+    global rsm
     # Reads the lecture/session identifier from the source's initial hello message
     session = hello.get("session")
     print(f"source connected: session={session}", flush=True)
@@ -227,9 +235,6 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
                 print("source finished", flush=True)
-                source_done = True
-                for state in clients.values():
-                    state.wake.set()
             else:
                 # Forward compatibility: ignore fields/messages this baseline
                 # doesn't understand rather than crashing.

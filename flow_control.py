@@ -54,7 +54,6 @@ RTT_BASELINE_QUANTILE = 0.25  # Must be in (0, 1]; lower selects a lower baselin
 RTT_MIN_ALLOWANCE = 0.150      # Floor for tolerance of transient delay.
 RTT_BASELINE_ALLOWANCE = 0.5   # Multiplier applied to baseline RTT.
 RTT_JITTER_ALLOWANCE = 4.0     # Multiplier applied to calibration jitter.
-RTT_MAX_THRESHOLD = 1.0        # Do not let bad startup samples disable detection.
 
 # Draft withholding: lower times react sooner, but tolerate fewer brief spikes.
 LATE_PROBES_REQUIRED = 2       # Minimum consecutive late completed probes.
@@ -191,11 +190,11 @@ class FlowControl:
                 self.jitter = median(
                     abs(sample - middle) for sample in samples
                 )
-                self.rtt_threshold = min(RTT_MAX_THRESHOLD, self.baseline + max(
+                self.rtt_threshold = self.baseline + max(
                     RTT_MIN_ALLOWANCE,
                     RTT_BASELINE_ALLOWANCE * self.baseline,
                     RTT_JITTER_ALLOWANCE * self.jitter,
-                ))
+                )
 
             # Initial learning samples do not count toward sustained late delay.
             return
