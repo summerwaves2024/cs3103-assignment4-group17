@@ -30,13 +30,12 @@ class FlowControl:
 
     def state(self, now : float, stream_rate : float) -> ClientStatus:
         """Which flow-control state the client is in right now."""
-        if self.probe_t is not None and now - self.probe_t > self._late_after():
-            return ClientStatus.BEHIND
-        if self.reprobe_at is None or self._can_keep_up(stream_rate):
-            return ClientStatus.NORMAL
-        if now < self.reprobe_at:
-            return ClientStatus.FINALS_ONLY
-        return ClientStatus.REPROBING
+        # Experimental queue-first policy: the sender already gives queued
+        # finals priority over drafts. RTT/pong delay is retained for
+        # diagnostics, but it must not classify a healthy client as slow under
+        # network impairment. This avoids turning packet delay into a false
+        # FINALS_ONLY transition.
+        return ClientStatus.NORMAL
 
     def update_mode(self, now : float, stream_rate : float) -> ClientStatus | None:
         """Refresh self.mode; return the previous state if it changed."""

@@ -204,7 +204,10 @@ function applyCaption(msg) {
   fillCaptionRow(line, msg);
  
   // Record the latest final segment and revision for reconnect recovery.
-  if (msg.final && msg.segment > lastFinal.segment) {
+  if (msg.final && (
+    msg.segment > lastFinal.segment ||
+    (msg.segment === lastFinal.segment && msg.revision > lastFinal.revision)
+  )) {
     lastFinal = { segment: msg.segment, revision: msg.revision };
   }
   return true

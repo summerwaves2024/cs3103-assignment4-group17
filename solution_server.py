@@ -37,6 +37,8 @@ clients: dict[ServerConnection, ClientState] = {} # keyed by socket
 overloaded_clients: set[ServerConnection] = set()
 rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO
 update_times: deque[float] = deque() # source updates used to measure stream rate
+source_done = False
+active_session: str | None = None
 
 # In charge of parsing and validating an incoming caption message from the original source.
 def parse_caption(msg: dict[str, Any]) -> Caption | None:
@@ -133,6 +135,9 @@ def on_final(caption: Caption) -> None:
             )
             continue
         state.pending_finals.append(caption)
+        # Queue pressure is per-client. A single queued final is normal; a
+        # growing queue means drafts should wait until finals catch up.
+        state.final_pressure = len(state.pending_finals) > 1
         # The final supersedes any unsent draft of the same segment.
         if state.pending_active is not None and state.pending_active.segment == caption.segment:
             state.pending_active = None
@@ -176,17 +181,44 @@ async def client_sender(state: ClientState) -> None:
             # Sender sleeps until a new draft, final caption or even pong wakes it up
             await state.wake.wait()
             state.wake.clear()
-            while state.pending_finals or state.pending_active is not None:
+            while (state.pending_finals or state.pending_active is not None
+                   or (source_done and not state.terminal_sync_sent)):
+                if source_done and not state.terminal_sync_sent:
+                    missing = [
+                        c for c in finals_log
+                        if (c.segment > state.last_final[0]
+                            or (c.segment == state.last_final[0]
+                                and c.revision > state.last_final[1]))
+                    ]
+                    state.pending_finals.clear()
+                    state.pending_active = None
+                    state.terminal_sync_sent = True
+                    if missing:
+                        await state.ws.send(json.dumps({
+                            "type": "HISTORY",
+                            "items": [
+                                {key: value for key, value in caption_to_dict(c).items()
+                                 if key != "type"}
+                                for c in missing
+                            ],
+                        }))
+                        state.last_final = (
+                            missing[-1].segment, missing[-1].revision
+                        )
+                    continue
+
                 now = time.monotonic()
                 # send unsent finals first (from oldest to newest)
                 if state.pending_finals:
                     caption = state.pending_finals.popleft()
-                    state.last_final = (caption.segment, caption.revision)
                 # if no more finals left to send, send the actively changing one
                 else:
                     log_mode(state, now)
                     # If there are no pending finals, it checks flow control.
-                    delay = flow.draft_delay(now, stream_rate(now))
+                    delay = (
+                        None if state.final_pressure
+                        else flow.draft_delay(now, stream_rate(now))
+                    )
                     if delay is None or delay > 0:
                         # Client is behind: hold the draft (a newer one may replace
                         # it). Wait `delay` seconds, or with no timeout (None) until
@@ -201,7 +233,14 @@ async def client_sender(state: ClientState) -> None:
                     state.pending_active = None
                 # Only this per-client task sends through that client's WebSocket.
                 await state.ws.send(json.dumps(caption_to_dict(caption)))
+                # Advance the reconnect checkpoint only after the WebSocket
+                # send completes. If the connection drops during send, the
+                # final remains recoverable from history on reconnect.
+                if caption.final:
+                    state.last_final = (caption.segment, caption.revision)
                 flow.on_send()
+                if caption.final and not state.pending_finals:
+                    state.final_pressure = False
                 # Ping after sending: the pong only returns once the client has
                 # read up to here, which is how flow control sees its lag.
                 # In short, the pong is how quickly the client is consuming data.
@@ -214,9 +253,29 @@ async def client_sender(state: ClientState) -> None:
 
 # As a whole, it manages the connection from caption_source.py. 
 async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
-    global rsm
+    global rsm, source_done, active_session, active
     # Reads the lecture/session identifier from the source's initial hello message
     session = hello.get("session")
+
+    # A different session is a new lecture, not a source reconnect.  Do not
+    # let the previous lecture's revision state or history reject/serve the
+    # new lecture's captions.
+    if active_session is not None and session != active_session:
+        # Existing sockets belong to the old lecture. Close them before the
+        # new source starts publishing so they cannot receive mixed sessions.
+        old_clients = list(clients)
+        clients.clear()
+        for old_ws in old_clients:
+            asyncio.create_task(
+                old_ws.close(code=1001, reason="Lecture session changed")
+            )
+        finals_log.clear()
+        update_times.clear()
+        active = None
+        rsm = RevisionStateManager(session)
+
+    source_done = False
+    active_session = session
     print(f"source connected: session={session}", flush=True)
 
     # One manager for the lifetime of the server, so a reconnecting source
@@ -261,6 +320,9 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
+                source_done = True
+                for state in clients.values():
+                    state.wake.set()
                 print("source finished", flush=True)
             else:
                 # Forward compatibility: ignore fields/messages this baseline
@@ -273,7 +335,8 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
 
 # It selects the finalised captions in order to send it to a 
 # reconnecting or late-joining client. 
-def history_items(last_segment: int, history_seconds: float, now: float) -> list[Caption]:
+def history_items(last_segment: int, last_revision: int,
+                  history_seconds: float, now: float) -> list[Caption]:
     # Calculating the oldest timestamp that should still be included.
     cutoff = now - history_seconds
     # Returns only captions that satisfy both conditions:
@@ -283,9 +346,15 @@ def history_items(last_segment: int, history_seconds: float, now: float) -> list
     # This essentially prevents duplicate captions during reconnect. Additionally, it 
     # also avoids sending captions older than the selected recall period.
     return [c for c in finals_log
-            if c.segment > last_segment and c.source_ts >= cutoff]
+            if (c.segment > last_segment
+                or (c.segment == last_segment and c.revision > last_revision))
+            and c.source_ts >= cutoff]
 
 async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
+    session = hello.get("session")
+    if active_session is not None and session != active_session:
+        await ws.close(code=1008, reason="Client session does not match source")
+        return
     client_id = hello.get("client_id")
 
     try:
@@ -300,8 +369,16 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         # Resuming client: recover every final it missed (capped at 60 s),
         history_seconds = MAX_HISTORY_SECONDS
 
-    items = history_items(last_segment, history_seconds, time.time())
-    pending = active if active is not None and active.segment > last_segment else None
+    items = history_items(last_segment, last_revision,
+                          history_seconds, time.time())
+    pending = (
+        active
+        if active is not None
+        and (active.segment > last_segment
+             or (active.segment == last_segment
+                 and active.revision > last_revision))
+        else None
+    )
     state = ClientState(ws=ws, pending_finals=deque(),
                         pending_active=pending, last_final=(last_segment, last_revision),
                         client_id=client_id)
