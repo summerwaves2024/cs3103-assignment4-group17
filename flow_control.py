@@ -1,8 +1,12 @@
-"""Decide when to hold caption drafts and monitor each client's connection.
+"""Per-client draft admission for the LiveRecall server.
 
-All durations are in seconds. Times come from monotonic(), a clock that is
-unaffected by changes to the system date. RTT means ping round-trip time;
-baseline means the estimated normal RTT; jitter means normal RTT variation.
+Finalized captions are never gated by this module. It only decides whether a
+replaceable provisional caption may be sent. The implementation has three
+independent concerns: RTT observation, finalized-queue pressure, and cautious
+draft recovery. Keeping those concerns separate is important because an RTT
+spike alone must not discard or delay finalized captions.
+
+All durations are in seconds and use monotonic time.
 """
 
 import asyncio
@@ -95,7 +99,12 @@ MAX_RETRY = 30.0
 RETRY_BACKOFF_MULTIPLIER = 2.0
 
 class FlowControl:
-    """Store measurements and choose a mode without sending or awaiting data."""
+    """Store per-client observations and choose draft admission mode.
+
+    This class does not send WebSocket data. ``PingFlowControl`` owns the
+    transport adapter; this class only records observations and returns a
+    draft delay decision.
+    """
 
     def __init__(self):
         # The initial calibration samples establish these estimates. This version

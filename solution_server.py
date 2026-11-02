@@ -39,6 +39,7 @@ clients: dict[ServerConnection, BaseClientState] = {} # keyed by socket
 overloaded_clients: set[ServerConnection] = set()
 rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO
 flow_control = FlowControlManager()
+source_done = False  # no new drafts can arrive after SOURCE_DONE
 
 # In charge of parsing and validating an incoming caption message from the original source.
 def parse_caption(msg: dict[str, Any]) -> Caption | None:
@@ -155,7 +156,10 @@ async def client_sender(state: BaseClientState) -> None:
                     state.inflight_final = caption
                 # if no more finals left to send, send the actively changing one
                 else:
-                    delay = state.draft_delay()
+                    # Once the source has ended, only queued finals matter.
+                    # Do not leave the final drain behind a draft policy that
+                    # is designed for a still-live stream.
+                    delay = 0.0 if source_done else state.draft_delay()
                     if delay is None or delay > 0:
                         # Client is behind: hold the draft (a newer one may replace
                         # it). Wait `delay` seconds, or with no timeout (None) until
@@ -190,9 +194,10 @@ async def client_sender(state: BaseClientState) -> None:
 
 # As a whole, it manages the connection from caption_source.py.
 async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
-    global rsm
+    global rsm, source_done
     # Reads the lecture/session identifier from the source's initial hello message
     session = hello.get("session")
+    source_done = False
     print(f"source connected: session={session}", flush=True)
 
     # One manager for the lifetime of the server, so a reconnecting source
@@ -234,6 +239,9 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
+                source_done = True
+                for state in clients.values():
+                    state.wake.set()
                 print("source finished", flush=True)
             else:
                 # Forward compatibility: ignore fields/messages this baseline
@@ -246,7 +254,8 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
 
 # It selects the finalised captions in order to send it to a
 # reconnecting or late-joining client.
-def history_items(last_segment: int, history_seconds: float, now: float) -> list[Caption]:
+def history_items(last_segment: int, last_revision: int,
+                  history_seconds: float, now: float) -> list[Caption]:
     # Calculating the oldest timestamp that should still be included.
     cutoff = now - history_seconds
     # Returns only captions that satisfy both conditions:
@@ -256,7 +265,9 @@ def history_items(last_segment: int, history_seconds: float, now: float) -> list
     # This essentially prevents duplicate captions during reconnect. Additionally, it
     # also avoids sending captions older than the selected recall period.
     return [c for c in finals_log
-            if c.segment > last_segment and c.source_ts >= cutoff]
+            if (c.segment > last_segment
+                or (c.segment == last_segment and c.revision > last_revision))
+            and c.source_ts >= cutoff]
 
 async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
     client_id = hello.get("client_id")
@@ -273,8 +284,16 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         # Resuming client: recover every final it missed (capped at 60 s),
         history_seconds = MAX_HISTORY_SECONDS
 
-    items = history_items(last_segment, history_seconds, time.time())
-    pending = active if active is not None and active.segment > last_segment else None
+    items = history_items(last_segment, last_revision,
+                          history_seconds, time.time())
+    pending = (
+        active
+        if active is not None
+        and (active.segment > last_segment
+             or (active.segment == last_segment
+                 and active.revision > last_revision))
+        else None
+    )
     wake = asyncio.Event()
     client_options = dict(ws=ws, pending_finals=deque(),
                           pending_active=pending, last_final=(last_segment, last_revision),
