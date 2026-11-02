@@ -227,7 +227,7 @@ class FlowControl:
             self.healthy_count += 1
         # tick() from monitor will use these measurements together with queue waiting times.
 
-    # This function is for recovery during the REPROBE (or trial phase)
+    # Check and measure if we can transition from REPROBE to NROMAL
     def record_send(self, now: float) -> None:
         """Count completed caption sends while testing resumed delivery.
 
@@ -237,6 +237,8 @@ class FlowControl:
         if self.mode is not ClientStatus.REPROBING:
             return
         if self.trial_last_send is not None:
+
+            # Roughly ga
             gap = now - self.trial_last_send
             # Cap time credited per gap so a long idle period contributes
             # only limited time, rather than making an idle trial look successful.
