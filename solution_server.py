@@ -29,12 +29,14 @@ from websockets.asyncio.server import ServerConnection
 HISTORY_KEEP_SECONDS = 90 # how long the server keeps finalised captions
 MAX_HISTORY_SECONDS = 60 # the maximum history a client can request
 DEFAULT_HISTORY_SECONDS = 30 # default/recall window when the client does not specify one
-MAX_PENDING_FINALS = 256  # maximum for per-client finalized-caption backlog
+MAX_PENDING_FINALS = 1024  # bounded finalized-caption backlog before reconnect
+DRAFT_DEBOUNCE_SECONDS = 0.08  # allow rapid provisional revisions to coalesce
 
 
 
 finals_log: deque[Caption] = deque()  # finals in segment order, trimmed to HISTORY_KEEP_SECONDS
 active: Caption | None = None          # newest draft of the current segment
+source_done = False                    # source has no more captions to produce
 clients: dict[ServerConnection, BaseClientState] = {} # keyed by socket
 overloaded_clients: set[ServerConnection] = set()
 rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO
@@ -149,13 +151,41 @@ async def client_sender(state: BaseClientState) -> None:
             state.wake.clear()
 
             while state.pending_finals or state.pending_active is not None:
+                # Once the source has ended, package any remaining finalized
+                # captions into one completion snapshot. This is only used
+                # for the terminal backlog; normal live delivery remains one
+                # CAPTION_UPDATE at a time.
+                batch_recovery = (
+                    source_done
+                    or (len(state.pending_finals) >= 4
+                        and state.delivery_status == "FINALS_ONLY")
+                )
+                if batch_recovery and state.pending_finals:
+                    batch = list(state.pending_finals)
+                    state.pending_finals.clear()
+                    payload = {
+                        "type": "HISTORY",
+                        "items": [
+                            {key: value for key, value in caption_to_dict(c).items()
+                             if key != "type"}
+                            for c in batch
+                        ],
+                    }
+                    await state.ws.send(json.dumps(payload))
+                    state.last_final = (batch[-1].segment, batch[-1].revision)
+                    await state.after_send()
+                    continue
+
                 # send unsent finals first (from oldest to newest)
                 if state.pending_finals:
                     caption = state.pending_finals.popleft()
                     state.inflight_final = caption
                 # if no more finals left to send, send the actively changing one
                 else:
-                    delay = state.draft_delay()
+                    # Once the source is finished, there is no live draft
+                    # stream left to protect. Let queued finals drain without
+                    # waiting for another probe/recovery transition.
+                    delay = 0.0 if source_done else state.draft_delay()
                     if delay is None or delay > 0:
                         # Client is behind: hold the draft (a newer one may replace
                         # it). Wait `delay` seconds, or with no timeout (None) until
@@ -166,8 +196,28 @@ async def client_sender(state: BaseClientState) -> None:
                             pass
                         state.wake.clear()
                         continue
-                    caption = state.pending_active
-                    state.pending_active = None
+                    # Provisional captions can be revised several times in a
+                    # short burst. Give a newer revision a chance to replace
+                    # the pending one before spending a network write on an
+                    # obsolete draft. Finals still take priority and wake us.
+                    draft = state.pending_active
+                    if source_done:
+                        # No more revisions can arrive after SOURCE_DONE.
+                        caption = draft
+                        state.pending_active = None
+                    else:
+                        try:
+                            await asyncio.wait_for(
+                                state.wake.wait(), DRAFT_DEBOUNCE_SECONDS
+                            )
+                            state.wake.clear()
+                            continue
+                        except asyncio.TimeoutError:
+                            pass
+                        if state.pending_finals or state.pending_active is not draft:
+                            continue
+                        caption = draft
+                        state.pending_active = None
 
                 try:
                     state.send_started_t = time.monotonic()
@@ -183,16 +233,20 @@ async def client_sender(state: BaseClientState) -> None:
                 # Observe a completed caption send (final or draft) for flow control.
                 await state.after_send()
 
-                # Yield to other runnable tasks (like ping flow control)
-                await asyncio.sleep(0)
+                # A websocket send already yields when the transport needs
+                # backpressure. Avoid adding another delay between queued
+                # finals, so slow clients can drain their final backlog.
+                if not caption.final:
+                    await asyncio.sleep(0)
     except websockets.ConnectionClosed:
         pass  # handle_client's finally does the cleanup
 
 # As a whole, it manages the connection from caption_source.py.
 async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
-    global rsm
+    global rsm, source_done
     # Reads the lecture/session identifier from the source's initial hello message
     session = hello.get("session")
+    source_done = False
     print(f"source connected: session={session}", flush=True)
 
     # One manager for the lifetime of the server, so a reconnecting source
@@ -234,7 +288,10 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
             elif msg_type == "SOURCE_DONE":
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
-                print("source finished", flush=True)
+                source_done = True
+                for state in clients.values():
+                    state.wake.set()
+                print("source finished; draining finalized captions", flush=True)
             else:
                 # Forward compatibility: ignore fields/messages this baseline
                 # doesn't understand rather than crashing.
@@ -260,6 +317,13 @@ def history_items(last_segment: int, history_seconds: float, now: float) -> list
 
 async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
     client_id = hello.get("client_id")
+
+    # Keep the OS write buffer small enough that slow-reader backpressure is
+    # visible to the sender and flow-control monitor instead of being hidden
+    # behind a large socket buffer.
+    transport = getattr(ws, "transport", None)
+    if transport is not None:
+        transport.set_write_buffer_limits(high=8192, low=2048)
 
     try:
         last_segment = max(0, int(hello.get("last_segment") or 0))

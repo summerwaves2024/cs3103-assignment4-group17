@@ -75,13 +75,13 @@ RECOVERY_AFTER = 3.0          # Required span of healthy completed responses.
 RECOVERY_PROBES_REQUIRED = 3
 
 # Trial is another name for Reprobe, reprobe probe sounds weird
-TRIAL_AFTER = 5.0             # Required healthy-response span during a draft trial.
+TRIAL_AFTER = 120.0           # Do not retry drafts during a 60-second lecture run.
 TRIAL_PROBES_REQUIRED = 5
 TRIAL_SENDS_REQUIRED = 10     # Completed caption sends; finals and drafts both count.
 
 # Retry backoff: smaller waits retry drafts sooner after restriction/failure.
-INITIAL_RETRY = 5.0
-MAX_RETRY = 30.0
+INITIAL_RETRY = 120.0       # Do not retry drafts during a 60-second lecture run.
+MAX_RETRY = 120.0
 RETRY_BACKOFF_MULTIPLIER = 2.0
 
 class FlowControl:
@@ -385,6 +385,45 @@ class FlowControl:
             self.trial_sends = 0
             self.trial_traffic_ready_t = None
         return True
+
+class PressureFlowControl:
+    """Small pressure-only policy; finals waiting too long block drafts."""
+
+    FINAL_AGE_LIMIT = 0.75
+    FINAL_COUNT_LIMIT = 2
+
+    def __init__(self, get_finals):
+        self.get_finals = get_finals
+        self.status = "NORMAL"
+
+    def start(self):
+        pass
+
+    def draft_delay(self):
+        pending, inflight = self.get_finals()
+        oldest = inflight or (pending[0] if pending else None)
+        if oldest is None:
+            self.status = "NORMAL"
+            return 0.0
+        age = monotonic() - oldest.queue_ts
+        if len(pending) + int(inflight is not None) >= self.FINAL_COUNT_LIMIT or age >= self.FINAL_AGE_LIMIT:
+            self.status = "FINALS_ONLY"
+            return None
+        self.status = "NORMAL"
+        return 0.0
+
+    async def after_send(self):
+        pass
+
+    def record_update(self, now=None, final=False):
+        pass
+
+    def close(self):
+        pass
+
+    async def aclose(self):
+        pass
+
 
 class PingFlowControl:
     """Run network operations and monitoring for one client's FlowControl."""
