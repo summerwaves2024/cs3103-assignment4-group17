@@ -135,9 +135,10 @@ def on_final(caption: Caption) -> None:
             )
             continue
         state.pending_finals.append(caption)
-        # Queue pressure is per-client. A single queued final is normal; a
-        # growing queue means drafts should wait until finals catch up.
-        state.final_pressure = len(state.pending_finals) > 1
+        # Queue pressure is per-client. Once even one final is waiting, hold
+        # drafts until that final is delivered so provisional traffic cannot
+        # delay finalized-caption recovery for a slow client.
+        state.final_pressure = bool(state.pending_finals)
         # The final supersedes any unsent draft of the same segment.
         if state.pending_active is not None and state.pending_active.segment == caption.segment:
             state.pending_active = None
@@ -276,6 +277,11 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
 
     source_done = False
     active_session = session
+    # A source reconnect starts a new delivery phase for existing clients.
+    # Otherwise a client that saw an earlier SOURCE_DONE would never receive
+    # the completion fence for this resumed source connection.
+    for state in clients.values():
+        state.terminal_sync_sent = False
     print(f"source connected: session={session}", flush=True)
 
     # One manager for the lifetime of the server, so a reconnecting source
@@ -405,6 +411,8 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
             state.sender.cancel()
         print(f"client disconnected: id={client_id}; mode={state.flow.mode.name}; "
               f"drafts_dropped={state.drafts_dropped}; "
+              f"pending_finals={len(state.pending_finals)}; "
+              f"last_final={state.last_final}; "
               f"clients={len(clients)}", flush=True)
 
 # Should be the first function called for ever new WebSocket connection / new client connection.

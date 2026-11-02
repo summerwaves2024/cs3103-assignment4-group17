@@ -1,10 +1,10 @@
 from enum import Enum
 
 class ClientStatus(Enum):
-    NORMAL = 1       # every revision is sent
-    BEHIND = 2       # a ping is overdue right now: drafts held
-    FINALS_ONLY = 3  # too slow for the full stream: drafts held until a re-probe
-    REPROBING = 4    # drafts resumed to test whether the client got faster
+    # Delivery decisions are made from the client's finalized-caption queue
+    # in solution_server.py. NORMAL is retained as a diagnostic label so the
+    # existing client logs and ClientState interface remain compatible.
+    NORMAL = 1
 
 PROBE_INTERVAL = 0.1   # at most one ping per client per 100 ms
 LATE_MIN = 0.2         # a pong is never "late" below 200 ms, like TCP_RTO_MIN
@@ -29,12 +29,12 @@ class FlowControl:
         self.mode = ClientStatus.NORMAL         # state when last checked (for logs)
 
     def state(self, now : float, stream_rate : float) -> ClientStatus:
-        """Which flow-control state the client is in right now."""
-        # Experimental queue-first policy: the sender already gives queued
-        # finals priority over drafts. RTT/pong delay is retained for
-        # diagnostics, but it must not classify a healthy client as slow under
-        # network impairment. This avoids turning packet delay into a false
-        # FINALS_ONLY transition.
+        """Return the compatibility status for the queue-based policy.
+
+        RTT samples are diagnostic only. Network delay is not treated as
+        proof that a client cannot keep up; the sender uses its actual final
+        backlog to decide whether drafts should wait.
+        """
         return ClientStatus.NORMAL
 
     def update_mode(self, now : float, stream_rate : float) -> ClientStatus | None:
@@ -43,13 +43,15 @@ class FlowControl:
         return old if old is not self.mode else None
 
     def draft_delay(self, now : float, stream_rate : float) -> float | None:
-        """Seconds to wait before a draft may be sent: 0 = send now,
-        None = wait until something wakes the sender (here, the late pong)."""
-        state = self.state(now, stream_rate)
-        if state is ClientStatus.BEHIND:
+        """Hold drafts while an outstanding probe is clearly overdue.
+
+        The finalized-caption queue remains the primary signal. This small
+        diagnostic fallback also catches clients whose socket buffer accepts
+        writes even though the browser is reading them slowly.
+        """
+        if (self.probe_t is not None
+                and now - self.probe_t > self._late_after()):
             return None
-        if state is ClientStatus.FINALS_ONLY:
-            return self.reprobe_at - now
         return 0.0
 
     def should_probe(self, now : float) -> bool:
