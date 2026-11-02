@@ -52,6 +52,7 @@ class BaseClientState:
   wake : asyncio.Event = field(default_factory=asyncio.Event) # tell the sender task there is work to do
                                                               # so we can individually send rather than broadcast
   sender : asyncio.Task | None = None
+  terminal_sync_sent : bool = False
   drafts_dropped : int = 0 # drafts overwritten before they could be sent
 
   def draft_delay(self) -> float | None:
