@@ -16,7 +16,6 @@ class FlowControl:
         self.srtt : float | None = None         # smoothed RTT of on-time pongs
         self.rttvar = 0.0                       # and its variation
         self.probe_t : float | None = None      # send time of the outstanding ping
-        self.probe_sent = 0                     # self.sent when that ping went out
         self.last_probe_t = 0.0
         self.draft_hold_until = 0.0              # hysteresis after an overdue probe
         self.healthy_pongs = 0                   # consecutive on-time probes
@@ -50,7 +49,6 @@ class FlowControl:
     def on_probe(self, now : float) -> None:
         self.probe_t = now
         self.last_probe_t = now
-        self.probe_sent = self.sent
 
     def on_pong(self, now : float) -> None:
         if self.probe_t is None:

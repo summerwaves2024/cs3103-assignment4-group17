@@ -28,7 +28,6 @@ HISTORY_KEEP_SECONDS = 90 # how long the server keeps finaslied captions
 MAX_HISTORY_SECONDS = 60 # the maximum history a client can request 
 DEFAULT_HISTORY_SECONDS = 30 # default/recall window when the client does not specify one
 MAX_PENDING_FINALS = 256  # maximum for per-client finalized-caption backlog
-STREAM_WINDOW = 10.0 # duration of the window used to measure the source stream rate, which is then used in flow control
 
 
 
@@ -37,9 +36,9 @@ active: Caption | None = None          # newest draft of the current segment
 clients: dict[ServerConnection, ClientState] = {} # keyed by socket
 overloaded_clients: set[ServerConnection] = set()
 rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO
-update_times: deque[float] = deque() # source updates used to measure stream rate
 source_done = False
 terminal_finals_snapshot: tuple[Caption, ...] = ()
+terminal_finals_wire: tuple[dict[str, Any], ...] = ()
 active_session: str | None = None
 
 # In charge of parsing and validating an incoming caption message from the original source.
@@ -112,13 +111,6 @@ def trim_finals_log(now: float) -> None:
     if pruned_seg:
         # Remove the oldest caption from the left side of the deque 
         rsm.prune(pruned_seg)
-
-# Overall, is in charge of calculating how quickly the caption source 
-# is sending updates.
-def stream_rate(now: float) -> float:
-    while update_times and update_times[0] < now - STREAM_WINDOW:
-        update_times.popleft()
-    return len(update_times) / STREAM_WINDOW
 
 # In short, it handles a new provisional caption from the original source
 # and distributes the latest version to every client.
@@ -208,10 +200,13 @@ async def client_sender(state: ClientState) -> None:
                    or (source_done and not state.terminal_sync_sent)):
                 if source_done and not state.terminal_sync_sent:
                     missing = [
-                        c for c in terminal_finals_snapshot
-                        if (c.segment > state.last_final[0]
-                            or (c.segment == state.last_final[0]
-                                and c.revision > state.last_final[1]))
+                        (caption, wire)
+                        for caption, wire in zip(
+                            terminal_finals_snapshot, terminal_finals_wire
+                        )
+                        if (caption.segment > state.last_final[0]
+                            or (caption.segment == state.last_final[0]
+                                and caption.revision > state.last_final[1]))
                     ]
                     state.pending_finals.clear()
                     state.pending_active = None
@@ -219,14 +214,11 @@ async def client_sender(state: ClientState) -> None:
                     if missing:
                         await state.ws.send(json.dumps({
                             "type": "HISTORY",
-                            "items": [
-                                {key: value for key, value in caption_to_dict(c).items()
-                                 if key != "type"}
-                                for c in missing
-                            ],
+                            "items": [wire for _, wire in missing],
                         }))
+                        last_caption = missing[-1][0]
                         state.last_final = (
-                            missing[-1].segment, missing[-1].revision
+                            last_caption.segment, last_caption.revision
                         )
                     continue
 
@@ -266,8 +258,12 @@ async def client_sender(state: ClientState) -> None:
                 # Ping after sending: the pong only returns once the client has
                 # read up to here, which is how flow control sees its lag.
                 # In short, the pong is how quickly the client is consuming data.
-                if flow.should_probe(now):
-                    flow.on_probe(now)
+                # Once the source has finished, spend the sender's time only
+                # on draining finalized captions; probes cannot improve the
+                # terminal delivery decision.
+                probe_now = time.monotonic()
+                if not source_done and flow.should_probe(probe_now):
+                    flow.on_probe(probe_now)
                     pong = await state.ws.ping()
                     pong.add_done_callback(lambda fut: on_pong(state, fut))
     except websockets.ConnectionClosed:
@@ -275,7 +271,8 @@ async def client_sender(state: ClientState) -> None:
 
 # As a whole, it manages the connection from caption_source.py. 
 async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
-    global rsm, source_done, active_session, active, terminal_finals_snapshot
+    global rsm, source_done, active_session, active
+    global terminal_finals_snapshot, terminal_finals_wire
     # Reads the lecture/session identifier from the source's initial hello message
     session = hello.get("session")
 
@@ -293,18 +290,23 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
             )
         finals_log.clear()
         terminal_finals_snapshot = ()
-        update_times.clear()
+        terminal_finals_wire = ()
         active = None
         rsm = RevisionStateManager(session)
 
     source_done = False
     terminal_finals_snapshot = ()
+    terminal_finals_wire = ()
     active_session = session
     # A source reconnect starts a new delivery phase for existing clients.
     # Otherwise a client that saw an earlier SOURCE_DONE would never receive
     # the completion fence for this resumed source connection.
     for state in clients.values():
         state.terminal_sync_sent = False
+        # Terminal draining may have emptied the final queue while leaving
+        # the old pressure marker set.  Clear it for the new source phase so
+        # drafts are not held indefinitely after a source reconnect.
+        state.final_pressure = bool(state.pending_finals)
     print(f"source connected: session={session}", flush=True)
 
     # One manager for the lifetime of the server, so a reconnecting source
@@ -334,14 +336,6 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
                 is_accepted, _ = rsm.process_caption(caption)
                 if not is_accepted:
                     continue
-                now = time.monotonic()
-
-                # Prune update_times so that the flow calculation remains
-                # bounded even if no clients are connected.
-                stream_rate(now)
-
-                update_times.append(now)
-
                 if caption.final:
                     on_final(caption)
                 else:
@@ -354,6 +348,14 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
                 # drain the same finalized history, even if their sender
                 # tasks are scheduled at slightly different times.
                 terminal_finals_snapshot = tuple(finals_log)
+                terminal_finals_wire = tuple(
+                    {
+                        key: value
+                        for key, value in caption_to_dict(caption).items()
+                        if key != "type"
+                    }
+                    for caption in terminal_finals_snapshot
+                )
                 for state in clients.values():
                     if not state.wake.is_set():
                         state.wake.set()
@@ -425,7 +427,8 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
                                   "items": [caption_to_dict(c) for c in items]}))
         # The current draft (if any) follows as a normal CAPTION_UPDATE.
         state.sender = asyncio.create_task(client_sender(state))
-        state.wake.set()
+        if not state.wake.is_set():
+            state.wake.set()
         # Student clients normally don't send further messages after hello.
         # Keep the WebSocket open until the client disconnects.
         async for _ in ws:
