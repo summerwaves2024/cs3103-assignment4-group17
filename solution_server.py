@@ -17,6 +17,7 @@ import json
 import time
 from typing import Any
 from collections import deque
+from functools import lru_cache
 from data_structs import Caption, ClientState, SourceHello, ClientHello
 from revision_state_manager import RevisionStateManager
 
@@ -38,6 +39,7 @@ overloaded_clients: set[ServerConnection] = set()
 rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO
 update_times: deque[float] = deque() # source updates used to measure stream rate
 source_done = False
+terminal_finals_snapshot: tuple[Caption, ...] = ()
 active_session: str | None = None
 
 # In charge of parsing and validating an incoming caption message from the original source.
@@ -73,6 +75,33 @@ def caption_to_dict(caption: Caption) -> dict[str, Any]:
         "text": caption.text,
     }
 
+
+@lru_cache(maxsize=2048)
+def _caption_json(session: str, segment: int, revision: int,
+                 source_ts: float, final: bool, text: str) -> str:
+    """Serialize an immutable caption payload once for all recipients.
+
+    Caption objects are not mutated after they pass revision validation, so the
+    tuple of wire fields is a safe cache key.  The bound prevents a long-lived
+    source from turning this optimisation into unbounded memory growth.
+    """
+    return json.dumps({
+        "type": "CAPTION_UPDATE",
+        "session": session,
+        "segment": segment,
+        "revision": revision,
+        "source_ts": source_ts,
+        "final": final,
+        "text": text,
+    })
+
+
+def caption_to_json(caption: Caption) -> str:
+    return _caption_json(
+        caption.session, caption.segment, caption.revision,
+        caption.source_ts, caption.final, caption.text,
+    )
+
 #  Drop finals older than the 90-second recovery window and prune their 
 #  corresponding revision state. 
 def trim_finals_log(now: float) -> None:
@@ -105,7 +134,10 @@ def on_draft(caption: Caption) -> None:
         # If a previous draft was waiting to be sent, it is now obsolete since a newer draft arrived.
         state.pending_active = caption
         # Replaces the client's draft with the newest one.
-        state.wake.set()
+        # Coalesce redundant wakeups when several source revisions arrive
+        # before this client's sender task gets scheduled.
+        if not state.wake.is_set():
+            state.wake.set()
 
 # This handles a finalised caption from the original source.
 def on_final(caption: Caption) -> None:
@@ -143,17 +175,8 @@ def on_final(caption: Caption) -> None:
         if state.pending_active is not None and state.pending_active.segment == caption.segment:
             state.pending_active = None
         # Wakes the client's sender task so it can send the final caption.
-        state.wake.set()
-
-# Used for logging with respect to the flow control. 
-def log_mode(state: ClientState, now: float) -> None:
-    # Print the client's flow-control state whenever it changes.
-    old = state.flow.update_mode(now, stream_rate(now))
-    # Prevents repeated logs when the client is in the same state
-    if old is not None:
-        # Also prints the transitions such as client client-3: NORMAL -> BEHIND
-        # As a side note, flush=True makes the message appear immediately in the terminal
-        print(f"client {state.client_id}: {old.name} -> {state.flow.mode.name}", flush=True)
+        if not state.wake.is_set():
+            state.wake.set()
 
 # As a whole, it is called when a client replies to the server's ping.
 def on_pong(state: ClientState, future: asyncio.Future) -> None:
@@ -164,11 +187,10 @@ def on_pong(state: ClientState, future: asyncio.Future) -> None:
     now = time.monotonic()
     # Passes the pong time so that it can: calculate the ping round-trip time, determine if the client
     # is late, update the reading rate and change between the states. 
-    state.flow.on_pong(now, stream_rate(now))
-    # If state has changed, print a message.
-    log_mode(state, now)
+    state.flow.on_pong(now)
     # Wake up the sender so that it can recheck whether a held draft can be resent.
-    state.wake.set()
+    if not state.wake.is_set():
+        state.wake.set()
 
 # client_sender is the dedicated sending loop to one browser client. As a whole, 
 # the purpose is to ensure that a slow client does not block the source or other clients.
@@ -186,7 +208,7 @@ async def client_sender(state: ClientState) -> None:
                    or (source_done and not state.terminal_sync_sent)):
                 if source_done and not state.terminal_sync_sent:
                     missing = [
-                        c for c in finals_log
+                        c for c in terminal_finals_snapshot
                         if (c.segment > state.last_final[0]
                             or (c.segment == state.last_final[0]
                                 and c.revision > state.last_final[1]))
@@ -214,11 +236,10 @@ async def client_sender(state: ClientState) -> None:
                     caption = state.pending_finals.popleft()
                 # if no more finals left to send, send the actively changing one
                 else:
-                    log_mode(state, now)
                     # If there are no pending finals, it checks flow control.
                     delay = (
                         None if state.final_pressure
-                        else flow.draft_delay(now, stream_rate(now))
+                        else flow.draft_delay(now)
                     )
                     if delay is None or delay > 0:
                         # Client is behind: hold the draft (a newer one may replace
@@ -233,7 +254,7 @@ async def client_sender(state: ClientState) -> None:
                     caption = state.pending_active
                     state.pending_active = None
                 # Only this per-client task sends through that client's WebSocket.
-                await state.ws.send(json.dumps(caption_to_dict(caption)))
+                await state.ws.send(caption_to_json(caption))
                 # Advance the reconnect checkpoint only after the WebSocket
                 # send completes. If the connection drops during send, the
                 # final remains recoverable from history on reconnect.
@@ -254,7 +275,7 @@ async def client_sender(state: ClientState) -> None:
 
 # As a whole, it manages the connection from caption_source.py. 
 async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
-    global rsm, source_done, active_session, active
+    global rsm, source_done, active_session, active, terminal_finals_snapshot
     # Reads the lecture/session identifier from the source's initial hello message
     session = hello.get("session")
 
@@ -271,11 +292,13 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
                 old_ws.close(code=1001, reason="Lecture session changed")
             )
         finals_log.clear()
+        terminal_finals_snapshot = ()
         update_times.clear()
         active = None
         rsm = RevisionStateManager(session)
 
     source_done = False
+    terminal_finals_snapshot = ()
     active_session = session
     # A source reconnect starts a new delivery phase for existing clients.
     # Otherwise a client that saw an earlier SOURCE_DONE would never receive
@@ -327,8 +350,13 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
                 # Test-control message. The specification does not require it
                 # to be forwarded to clients.
                 source_done = True
+                # Freeze one shared completion boundary.  All clients now
+                # drain the same finalized history, even if their sender
+                # tasks are scheduled at slightly different times.
+                terminal_finals_snapshot = tuple(finals_log)
                 for state in clients.values():
-                    state.wake.set()
+                    if not state.wake.is_set():
+                        state.wake.set()
                 print("source finished", flush=True)
             else:
                 # Forward compatibility: ignore fields/messages this baseline
@@ -449,8 +477,9 @@ async def main_async(port: int) -> None:
         "0.0.0.0",
         port,
         max_size=2**20,
-        ping_interval=20,
-        ping_timeout=20,
+        # Keepalive is handled by the clients and the application-level
+        # flow-control probes; avoid a second server-side ping stream.
+        ping_interval=None,
     ):
         print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
         # Confirm that it started successfully.

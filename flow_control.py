@@ -7,12 +7,8 @@ class ClientStatus(Enum):
     NORMAL = 1
 
 PROBE_INTERVAL = 0.1   # at most one ping per client per 100 ms
+HEALTHY_PROBE_INTERVAL = 0.5  # reduce probe overhead after calibration
 LATE_MIN = 0.2         # a pong is never "late" below 200 ms, like TCP_RTO_MIN
-MEASURE_MIN = 2.0      # R is measured from two late pongs 2-20 s apart
-MEASURE_MAX = 20.0
-HEADROOM = 1.1         # R must exceed the stream rate by 10% to take it all
-REPROBE_AFTER = 60.0   # finals only for this long before trying drafts again
-RECOVERED_AFTER = 20.0 # no late pong this long after a re-probe -> recovered
 
 class FlowControl:
     def __init__(self):
@@ -22,27 +18,11 @@ class FlowControl:
         self.probe_t : float | None = None      # send time of the outstanding ping
         self.probe_sent = 0                     # self.sent when that ping went out
         self.last_probe_t = 0.0
-        self.last_late_t : float | None = None  # time and self.sent of the
-        self.last_late_sent = 0                 # last late pong
-        self.read_rate : float | None = None    # R, msgs/s the client reads
-        self.reprobe_at : float | None = None   # finals only until then (None = not)
+        self.draft_hold_until = 0.0              # hysteresis after an overdue probe
+        self.healthy_pongs = 0                   # consecutive on-time probes
         self.mode = ClientStatus.NORMAL         # state when last checked (for logs)
 
-    def state(self, now : float, stream_rate : float) -> ClientStatus:
-        """Return the compatibility status for the queue-based policy.
-
-        RTT samples are diagnostic only. Network delay is not treated as
-        proof that a client cannot keep up; the sender uses its actual final
-        backlog to decide whether drafts should wait.
-        """
-        return ClientStatus.NORMAL
-
-    def update_mode(self, now : float, stream_rate : float) -> ClientStatus | None:
-        """Refresh self.mode; return the previous state if it changed."""
-        old, self.mode = self.mode, self.state(now, stream_rate)
-        return old if old is not self.mode else None
-
-    def draft_delay(self, now : float, stream_rate : float) -> float | None:
+    def draft_delay(self, now : float) -> float | None:
         """Hold drafts while an outstanding probe is clearly overdue.
 
         The finalized-caption queue remains the primary signal. This small
@@ -52,10 +32,17 @@ class FlowControl:
         if (self.probe_t is not None
                 and now - self.probe_t > self._late_after()):
             return None
+        if now < self.draft_hold_until:
+            return None
         return 0.0
 
     def should_probe(self, now : float) -> bool:
-        return self.probe_t is None and now - self.last_probe_t >= PROBE_INTERVAL
+        interval = (
+            PROBE_INTERVAL
+            if self.healthy_pongs < 3 or now < self.draft_hold_until
+            else HEALTHY_PROBE_INTERVAL
+        )
+        return self.probe_t is None and now - self.last_probe_t >= interval
 
     def on_send(self) -> None:
         self.sent += 1
@@ -65,7 +52,7 @@ class FlowControl:
         self.last_probe_t = now
         self.probe_sent = self.sent
 
-    def on_pong(self, now : float, stream_rate : float) -> None:
+    def on_pong(self, now : float) -> None:
         if self.probe_t is None:
             return
         rtt = now - self.probe_t
@@ -73,27 +60,25 @@ class FlowControl:
         self.probe_t = None
 
         if not late:
+            self.healthy_pongs += 1
             # Based on RFC 6298 retransmission timer
             if self.srtt is None:
                 self.srtt, self.rttvar = rtt, rtt / 2
             else:
                 self.rttvar = 0.75 * self.rttvar + 0.25 * abs(self.srtt - rtt)
                 self.srtt = 0.875 * self.srtt + 0.125 * rtt
-            # Drafts resumed at a re-probe and it has stayed on time, then we recover
-            if (self.reprobe_at is not None and now >= self.reprobe_at
-                    and now - self.last_late_t >= RECOVERED_AFTER):
-                self.reprobe_at = None
+            # Do not resume drafts after a single lucky fast pong.  Requiring
+            # a few healthy samples avoids oscillating between drafts and
+            # finals-only behavior when the client is near its limit.
+            if self.healthy_pongs >= 3:
+                self.draft_hold_until = 0.0
             return
 
-        if self.last_late_t is not None and MEASURE_MIN <= now - self.last_late_t <= MEASURE_MAX:
-            self.read_rate = (self.probe_sent - self.last_late_sent) / (now - self.last_late_t)
-            finals_only = self.reprobe_at is not None and now < self.reprobe_at
-            if not self._can_keep_up(stream_rate) and not finals_only:
-                self.reprobe_at = now + REPROBE_AFTER
-        self.last_late_t, self.last_late_sent = now, self.probe_sent
-
-    def _can_keep_up(self, stream_rate : float) -> bool:
-        return self.read_rate is not None and self.read_rate >= HEADROOM * stream_rate
+        self.healthy_pongs = 0
+        # Keep drafts held briefly after a late pong.  The final queue remains
+        # the primary backlog signal; this is only hysteresis for clients whose
+        # socket accepts writes before the browser has consumed them.
+        self.draft_hold_until = max(self.draft_hold_until, now + 1.0)
 
     def _late_after(self) -> float:
         """RTT above which a pong counts as late: TCP's RTO rule."""
