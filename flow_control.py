@@ -9,6 +9,7 @@ class ClientStatus(Enum):
 PROBE_INTERVAL = 0.1   # at most one ping per client per 100 ms
 HEALTHY_PROBE_INTERVAL = 0.5  # reduce probe overhead after calibration
 LATE_MIN = 0.2         # a pong is never "late" below 200 ms, like TCP_RTO_MIN
+LATE_PROBES_REQUIRED = 2
 
 class FlowControl:
     def __init__(self):
@@ -19,6 +20,8 @@ class FlowControl:
         self.last_probe_t = 0.0
         self.draft_hold_until = 0.0              # hysteresis after an overdue probe
         self.healthy_pongs = 0                   # consecutive on-time probes
+        self.late_pongs = 0                      # consecutive overdue probes
+        self.finals_only = False                # recovery mode for a slow reader
         self.mode = ClientStatus.NORMAL         # state when last checked (for logs)
 
     def draft_delay(self, now : float) -> float | None:
@@ -30,6 +33,8 @@ class FlowControl:
         """
         if (self.probe_t is not None
                 and now - self.probe_t > self._late_after()):
+            return None
+        if self.finals_only:
             return None
         if now < self.draft_hold_until:
             return None
@@ -59,6 +64,7 @@ class FlowControl:
 
         if not late:
             self.healthy_pongs += 1
+            self.late_pongs = 0
             # Based on RFC 6298 retransmission timer
             if self.srtt is None:
                 self.srtt, self.rttvar = rtt, rtt / 2
@@ -70,9 +76,13 @@ class FlowControl:
             # finals-only behavior when the client is near its limit.
             if self.healthy_pongs >= 3:
                 self.draft_hold_until = 0.0
+                self.finals_only = False
             return
 
         self.healthy_pongs = 0
+        self.late_pongs += 1
+        if self.late_pongs >= LATE_PROBES_REQUIRED:
+            self.finals_only = True
         # Keep drafts held briefly after a late pong.  The final queue remains
         # the primary backlog signal; this is only hysteresis for clients whose
         # socket accepts writes before the browser has consumed them.
