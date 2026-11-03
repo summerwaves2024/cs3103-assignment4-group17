@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import json
 import time
+from contextlib import suppress
 from typing import Any
 from collections import deque
 from data_structs import Caption, ClientState, SourceHello, ClientHello
@@ -172,7 +173,6 @@ async def client_sender(state: ClientState) -> None:
                 # send unsent finals first (from oldest to newest)
                 if state.pending_finals:
                     caption = state.pending_finals.popleft()
-                    state.last_final = (caption.segment, caption.revision)
                 # if no more finals left to send, send the actively changing one
                 else:
                     log_mode(state, now)
@@ -192,6 +192,11 @@ async def client_sender(state: ClientState) -> None:
                     state.pending_active = None
                 # Only this per-client task sends through that client's WebSocket.
                 await state.ws.send(json.dumps(caption_to_dict(caption)))
+                # Advance the reconnect checkpoint only after the send
+                # succeeds. If the connection drops during send, recovery
+                # must resend this final rather than skipping it.
+                if caption.final:
+                    state.last_final = (caption.segment, caption.revision)
                 # Ping after sending: the pong only returns once the client has
                 # read up to here, which is how flow control sees its lag.
                 # In short, the pong is how quickly the client is consuming data.
@@ -256,17 +261,20 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
 
 # It selects the finalised captions in order to send it to a 
 # reconnecting or late-joining client. 
-def history_items(last_segment: int, history_seconds: float, now: float) -> list[Caption]:
+def history_items(last_segment: int, last_revision: int,
+                  history_seconds: float, now: float) -> list[Caption]:
     # Calculating the oldest timestamp that should still be included.
     cutoff = now - history_seconds
     # Returns only captions that satisfy both conditions:
-    # c.segment > last_segment: The client has not already received this segment.
+    # c.segment > last_segment, or the same segment with a newer revision.
     # c.source_ts >= cutoff: the caption is within the requested history window.
 
     # This essentially prevents duplicate captions during reconnect. Additionally, it 
     # also avoids sending captions older than the selected recall period.
     return [c for c in finals_log
-            if c.segment > last_segment and c.source_ts >= cutoff]
+            if (c.segment > last_segment
+                or (c.segment == last_segment and c.revision > last_revision))
+            and c.source_ts >= cutoff]
 
 async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
     client_id = hello.get("client_id")
@@ -283,8 +291,16 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         # Resuming client: recover every final it missed (capped at 60 s),
         history_seconds = MAX_HISTORY_SECONDS
 
-    items = history_items(last_segment, history_seconds, time.time())
-    pending = active if active is not None and active.segment > last_segment else None
+    items = history_items(last_segment, last_revision,
+                          history_seconds, time.time())
+    pending = (
+        active
+        if active is not None
+        and (active.segment > last_segment
+             or (active.segment == last_segment
+                 and active.revision > last_revision))
+        else None
+    )
     state = ClientState(ws=ws, pending_finals=deque(),
                         pending_active=pending, last_final=(last_segment, last_revision),
                         client_id=client_id)
@@ -309,6 +325,8 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         overloaded_clients.discard(ws)
         if state.sender is not None:
             state.sender.cancel()
+            with suppress(asyncio.CancelledError):
+                await state.sender
         print(f"client disconnected: id={client_id}; mode={state.flow.mode.name}; "
               f"drafts_dropped={state.drafts_dropped}; "
               f"clients={len(clients)}", flush=True)
