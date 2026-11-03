@@ -8,9 +8,14 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>LiveRecall Student Client</title>
   <style>
+    *, *::before, *::after {
+      box-sizing: border-box;
+    }
+
     html, body {
       height: 100%;
       margin: 0;
+      overflow: hidden;
     }
 
     body {
@@ -22,9 +27,10 @@
     /* The app fills the window and never grows: header, then the main area
        takes the remaining height. */
     .app {
-      box-sizing: border-box;
       height: 100vh;
       height: 100dvh;
+      min-height: 0;
+      width: 100%;
       max-width: 1400px;
       margin: 0 auto;
       padding: 1.25rem 1.5rem;
@@ -179,6 +185,8 @@
       background: #294c6b;
       color: #ffffff;
       border: 0;
+      padding: 0.35rem 0.65rem;
+      font-size: 0.85rem;
       box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
     }
 
@@ -236,10 +244,25 @@
       .recall-panel {
         flex: 0 0 45%;
         max-width: none;
+        min-height: 0;
       }
 
       .divider {
         display: none;
+      }
+    }
+
+    @media (max-height: 600px) {
+      .app {
+        padding-top: 0.75rem;
+        padding-bottom: 0.75rem;
+        gap: 0.5rem;
+      }
+
+      .panel-header,
+      .panel-footer {
+        padding-top: 0.5rem;
+        padding-bottom: 0.5rem;
       }
     }
 

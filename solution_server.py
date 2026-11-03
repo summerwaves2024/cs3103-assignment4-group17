@@ -26,13 +26,16 @@ from websockets.asyncio.server import ServerConnection
 HISTORY_KEEP_SECONDS = 90 # how long the server keeps finaslied captions 
 MAX_HISTORY_SECONDS = 60 # the maximum history a client can request 
 DEFAULT_HISTORY_SECONDS = 30 # default/recall window when the client does not specify one
-MAX_PENDING_FINALS = 256  # maximum for per-client backlog
-STREAM_WINDOW = 10.0 # duration of the window used to measure the source stream rate, which is then used in flow control to see if the client can keep up
+MAX_PENDING_FINALS = 256  # maximum for per-client finalized-caption backlog
+STREAM_WINDOW = 10.0 # duration of the window used to measure the source stream rate, which is then used in flow control
+
+
 
 finals_log: deque[Caption] = deque()  # finals in segment order, trimmed to HISTORY_KEEP_SECONDS
 active: Caption | None = None          # newest draft of the current segment
-clients: dict[ServerConnection, ClientState] = {} # tracks every connected client and its queue, flow-control and recovery position
-rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO; stores the revision manager to validate and update segments
+clients: dict[ServerConnection, ClientState] = {} # keyed by socket
+overloaded_clients: set[ServerConnection] = set()
+rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO
 update_times: deque[float] = deque() # source updates used to measure stream rate
 
 # In charge of parsing and validating an incoming caption message from the original source.
@@ -116,6 +119,19 @@ def on_final(caption: Caption) -> None:
         active = None
     # Processes every connected client independently.
     for state in clients.values():
+        if state.ws in overloaded_clients:
+            continue
+        if len(state.pending_finals) >= MAX_PENDING_FINALS:
+            # Do not silently drop finalized captions. Close an excessively
+            # delayed client so it reconnects and recovers from finals_log.
+            overloaded_clients.add(state.ws)
+            state.pending_active = None
+            print(f"client too far behind: id={state.client_id}; "
+                  f"pending_finals={len(state.pending_finals)}", flush=True)
+            asyncio.create_task(
+                state.ws.close(code=1013, reason="Client too far behind")
+            )
+            continue
         state.pending_finals.append(caption)
         # The final supersedes any unsent draft of the same segment.
         if state.pending_active is not None and state.pending_active.segment == caption.segment:
@@ -286,7 +302,7 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
 
     items = history_items(last_segment, history_seconds, time.time())
     pending = active if active is not None and active.segment > last_segment else None
-    state = ClientState(ws=ws, pending_finals=deque(maxlen=MAX_PENDING_FINALS),
+    state = ClientState(ws=ws, pending_finals=deque(),
                         pending_active=pending, last_final=(last_segment, last_revision),
                         client_id=client_id)
     clients[ws] = state
@@ -307,6 +323,7 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         pass
     finally:
         clients.pop(ws, None)
+        overloaded_clients.discard(ws)
         if state.sender is not None:
             state.sender.cancel()
         print(f"client disconnected: id={client_id}; mode={state.flow.mode.name}; "
