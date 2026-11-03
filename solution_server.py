@@ -28,6 +28,8 @@ HISTORY_KEEP_SECONDS = 90 # how long the server keeps finaslied captions
 MAX_HISTORY_SECONDS = 60 # the maximum history a client can request 
 DEFAULT_HISTORY_SECONDS = 30 # default/recall window when the client does not specify one
 MAX_PENDING_FINALS = 256  # maximum for per-client finalized-caption backlog
+MONITOR_INTERVAL = 0.05  # check probes independently of caption delivery
+PROBE_TIMEOUT = 20.0  # includes time blocked transmitting the ping
 
 
 
@@ -184,6 +186,46 @@ def on_pong(state: ClientState, future: asyncio.Future) -> None:
     if not state.wake.is_set():
         state.wake.set()
 
+
+async def measure_probe(state: ClientState) -> None:
+    """Send one ping without blocking the monitor's timer."""
+    pong = await state.ws.ping()
+    pong.add_done_callback(lambda future: on_pong(state, future))
+    # The WebSocket owns this future; cancelling our task must not cancel it.
+    await asyncio.shield(pong)
+
+
+async def client_monitor(state: ClientState) -> None:
+    """Schedule probes even while caption sends or draft waits are blocked."""
+    probe_task = None
+    probe_started = None
+    try:
+        while True:
+            now = time.monotonic()
+            if probe_task is not None and probe_task.done():
+                probe_task.result()
+                probe_task = None
+                probe_started = None
+            if (not source_done and probe_started is not None
+                    and now - probe_started >= PROBE_TIMEOUT):
+                await state.ws.close(code=1013, reason="Probe did not complete")
+                return
+            # Preserve terminal delivery: pause new probes after SOURCE_DONE,
+            # but keep the timer alive if the source later resumes this session.
+            if (not source_done and probe_task is None
+                    and state.flow.should_probe(now)):
+                probe_started = now
+                state.flow.on_probe(now)
+                probe_task = asyncio.create_task(measure_probe(state))
+            await asyncio.sleep(MONITOR_INTERVAL)
+    except websockets.ConnectionClosed:
+        pass
+    finally:
+        if probe_task is not None:
+            probe_task.cancel()
+            await asyncio.gather(probe_task, return_exceptions=True)
+
+
 # client_sender is the dedicated sending loop to one browser client. As a whole, 
 # the purpose is to ensure that a slow client does not block the source or other clients.
 async def client_sender(state: ClientState) -> None:
@@ -255,17 +297,6 @@ async def client_sender(state: ClientState) -> None:
                 flow.on_send()
                 if caption.final and not state.pending_finals:
                     state.final_pressure = False
-                # Ping after sending: the pong only returns once the client has
-                # read up to here, which is how flow control sees its lag.
-                # In short, the pong is how quickly the client is consuming data.
-                # Once the source has finished, spend the sender's time only
-                # on draining finalized captions; probes cannot improve the
-                # terminal delivery decision.
-                probe_now = time.monotonic()
-                if not source_done and flow.should_probe(probe_now):
-                    flow.on_probe(probe_now)
-                    pong = await state.ws.ping()
-                    pong.add_done_callback(lambda fut: on_pong(state, fut))
     except websockets.ConnectionClosed:
         pass  # handle_client's finally does the cleanup
 
@@ -422,6 +453,7 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
     print(f"client connected: id={client_id}; last_segment={last_segment}; "
           f"history={len(items)}; clients={len(clients)}", flush=True)
 
+    monitor = asyncio.create_task(client_monitor(state))
     try:
         await ws.send(json.dumps({"type": "HISTORY",
                                   "items": [caption_to_dict(c) for c in items]}))
@@ -440,6 +472,8 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         overloaded_clients.discard(ws)
         if state.sender is not None:
             state.sender.cancel()
+        monitor.cancel()
+        await asyncio.gather(monitor, return_exceptions=True)
         print(f"client disconnected: id={client_id}; mode={state.flow.mode.name}; "
               f"drafts_dropped={state.drafts_dropped}; "
               f"pending_finals={len(state.pending_finals)}; "
