@@ -200,8 +200,9 @@ async def client_sender(state: ClientState) -> None:
                 # Ping after sending: the pong only returns once the client has
                 # read up to here, which is how flow control sees its lag.
                 # In short, the pong is how quickly the client is consuming data.
-                if flow.should_probe(now):
-                    flow.on_probe(now)
+                probe_now = time.monotonic()
+                if flow.should_probe(probe_now):
+                    flow.on_probe(probe_now)
                     pong = await state.ws.ping()
                     pong.add_done_callback(lambda fut: on_pong(state, fut))
     except websockets.ConnectionClosed:
