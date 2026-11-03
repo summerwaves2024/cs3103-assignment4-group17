@@ -192,11 +192,6 @@ async def client_sender(state: ClientState) -> None:
                     state.pending_active = None
                 # Only this per-client task sends through that client's WebSocket.
                 await state.ws.send(json.dumps(caption_to_dict(caption)))
-                # Advance the reconnect checkpoint only after the send
-                # succeeds. If the connection drops during send, recovery
-                # must resend this final rather than skipping it.
-                if caption.final:
-                    state.last_final = (caption.segment, caption.revision)
                 # Ping after sending: the pong only returns once the client has
                 # read up to here, which is how flow control sees its lag.
                 # In short, the pong is how quickly the client is consuming data.
@@ -302,8 +297,7 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         else None
     )
     state = ClientState(ws=ws, pending_finals=deque(),
-                        pending_active=pending, last_final=(last_segment, last_revision),
-                        client_id=client_id)
+                        pending_active=pending, client_id=client_id)
     clients[ws] = state
     print(f"client connected: id={client_id}; last_segment={last_segment}; "
           f"history={len(items)}; clients={len(clients)}", flush=True)
