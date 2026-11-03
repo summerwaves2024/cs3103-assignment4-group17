@@ -189,6 +189,9 @@ def on_pong(state: ClientState, future: asyncio.Future) -> None:
 
 async def measure_probe(state: ClientState) -> None:
     """Send one ping without blocking the monitor's timer."""
+    # Ping independently of caption sending: the pong only returns once the client has
+    # read up to here, which is how flow control sees its lag.
+    # In short, the pong is how quickly the client is consuming data.
     pong = await state.ws.ping()
     pong.add_done_callback(lambda future: on_pong(state, future))
     # The WebSocket owns this future; cancelling our task must not cancel it.
@@ -210,8 +213,11 @@ async def client_monitor(state: ClientState) -> None:
                     and now - probe_started >= PROBE_TIMEOUT):
                 await state.ws.close(code=1013, reason="Probe did not complete")
                 return
-            # Preserve terminal delivery: pause new probes after SOURCE_DONE,
-            # but keep the timer alive if the source later resumes this session.
+            # Once the source has finished, spend the sender's time only
+            # on draining finalized captions; probes cannot improve the
+            # terminal delivery decision.
+            # Pause new probes after SOURCE_DONE, but keep the timer alive
+            # if the source later resumes this session.
             if (not source_done and probe_task is None
                     and state.flow.should_probe(now)):
                 probe_started = now
