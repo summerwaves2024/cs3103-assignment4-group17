@@ -46,7 +46,7 @@ class FlowControl:
 
     def draft_delay(self, now : float) -> float | None:
         """Seconds to wait before a draft may be sent: 0 = send now,
-        None = wait until something wakes the sender (here, the late pong)."""
+        None = wait until something wakes the sender (for example, an on-time pong)."""
         state = self.state(now)
         if state is ClientStatus.BEHIND:
             return None
@@ -72,6 +72,7 @@ class FlowControl:
         # Compare the measured RTT with the adaptive late-response threshold.
         late = rtt > self._late_after()
         self.probe_t = None
+        self.last_rtt = rtt
 
         if not late:
             # Use an RTT/RTO-style threshold so an isolated network spike does
@@ -89,7 +90,7 @@ class FlowControl:
         sustained = self.last_late_t is not None and LAG_MIN <= now - self.last_late_t <= LAG_MAX
         if sustained:
             self.finals_only_until = now + FINALS_ONLY_FOR
-        self.last_late_t = now
+            self.last_rtt = 0.0  # FINALS_ONLY supersedes BEHIND until retry.
 
     def _late_after(self) -> float:
         """Return the RTT threshold above which a pong is considered late."""

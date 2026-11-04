@@ -18,6 +18,7 @@ from contextlib import suppress
 from typing import Any
 from collections import deque
 from data_structs import Caption, ClientState, SourceHello, ClientHello
+from flow_control import MONITOR_INTERVAL
 from revision_state_manager import RevisionStateManager
 
 import websockets
@@ -333,6 +334,10 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         # cannot enqueue additional work for a socket that is closing.
         clients.pop(ws, None)
         overloaded_clients.discard(ws)
+        if state.monitor is not None:
+            state.monitor.cancel()
+            with suppress(asyncio.CancelledError):
+                await state.monitor
         if state.sender is not None:
             # Stop and await the sender so it cannot outlive the connection.
             state.sender.cancel()
@@ -373,8 +378,8 @@ async def main_async(port: int) -> None:
         "0.0.0.0",
         port,
         max_size=2**20,
-        ping_interval=20,
-        ping_timeout=20,
+        # client_monitor owns ping probes and the liveness timeout.
+        ping_interval=None,
     ):
         print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
         await asyncio.Future()
