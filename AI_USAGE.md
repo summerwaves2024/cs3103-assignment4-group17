@@ -2,7 +2,7 @@
 
 ## Tools used
 
-Codex was used during the development of the browser client in
+Codex (GPT-6.1-Sol - Medium) was used during the development of the browser client in
 `client/index.html` and `client/app.js`. Its use was limited to suggesting
 UI structure wording and explanatory comments for the live-caption panel and
 the recall panel. It also helped review the relationship between the HTML
@@ -13,6 +13,11 @@ The generated suggestions were treated as drafts. The team selected and
 adapted the relevant parts to fit the existing WebSocket protocol and the
 assignment requirements. No generated change was accepted without checking
 its effect on the existing interface and client behaviour.
+
+Additionally, Codex was used to prototype, develop, explain, check 
+and fix certain bugs in regards to the flow control. Mainly the monitoring
+system and how pings were sent out. Again no generated change was accepted 
+without verification and fact-checking.
 
 Claude Code generated `tools/slow_proxy.py`, the throttling TCP
 proxy used to demonstrate flow control with real browser tabs. It was needed
@@ -27,6 +32,15 @@ server.
 
 ## One useful suggestion
 
+Having Codex go through and explain parts of the code helped greatly in understading
+the specifics of how the code worked and lead to discoveries of certain inefficiences. 
+For example, there was previously a "bug" where the client could be consistently
+trapped in the BEHIND state if their connection was bad (i.e. RTT > 1s). Ideally, it
+should move to FINALS_ONLY to allievate the client from constant ping requests.
+This was identified when asking Codex specific questions on how the code would perform
+in certain scenarios. Then, when it raised an issue, asked Codex to highlight the
+problematic code, then manually scrutinize the codebase. Additionally, Codex was able
+to help debug the code at a much faster pace than doing it manually.
 
 ## One suggestion that was wrong inefficient or required modification
 
