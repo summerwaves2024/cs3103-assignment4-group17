@@ -7,6 +7,8 @@ class ClientStatus(Enum):
     FINALS_ONLY = 3  # Sustained lag holds drafts until the retry period ends.
 
 PROBE_INTERVAL = 0.1   # at most one ping per client per 100 ms
+# Compatibility name used by solution_server.py for the monitoring interval.
+MONITOR_INTERVAL = PROBE_INTERVAL
 LATE_MIN = 1.0         # Lower bound for a late pong threshold.
                        # Short browser or network hiccups stay below it.
 LATE_MAX = 3.0         # Upper bound for a late pong threshold.
