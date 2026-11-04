@@ -28,6 +28,8 @@ HISTORY_KEEP_SECONDS = 90 # how long the server keeps finaslied captions
 MAX_HISTORY_SECONDS = 60 # the maximum history a client can request 
 DEFAULT_HISTORY_SECONDS = 30 # default/recall window when the client does not specify one
 MAX_PENDING_FINALS = 256  # maximum for per-client finalized-caption backlog
+MONITOR_INTERVAL = 0.05  # Check flow state even when caption sending is blocked.
+PROBE_TIMEOUT = 20.0     # Includes blocked ping setup as well as a missing pong.
 
 
 
@@ -150,11 +152,71 @@ def on_pong(state: ClientState, future: asyncio.Future) -> None:
     now = time.monotonic()
     # Passes the pong time so that it can: calculate the ping round-trip time, determine if the client
     # is late, and change between the states.
-    state.flow.on_pong(now)
+    state.flow.on_pong(now, rtt=future.result())
     # If state has changed, print a message.
     log_mode(state, now)
     # Wake up the sender so that it can recheck whether a held draft can be resent.
     state.wake.set()
+
+async def measure_ping(state: ClientState) -> float:
+    """Use the library's RTT instead of timing the whole ws.ping() call."""
+    pong = await state.ws.ping()
+    # The library owns this future. Consume failures even after cancellation,
+    # and shield it so stopping the monitor doesn't cancel library state.
+    pong.add_done_callback(
+        lambda future: None if future.cancelled() else future.exception()
+    )
+    return await asyncio.shield(pong)
+
+
+async def client_monitor(state: ClientState) -> None:
+    """Keep checking flow state while one independent task measures a ping."""
+    probe_task = None
+    probe_started = None
+    flow = state.flow
+    try:
+        while True:
+            now = time.monotonic()
+            if probe_task is not None and probe_task.done():
+                # Surface connection failures to the monitor's cleanup rather
+                # than leaving the controller with an outstanding probe.
+                probe_task.result()
+                on_pong(state, probe_task)
+                probe_task = None
+                probe_started = None
+
+            if probe_started is not None and now - probe_started >= PROBE_TIMEOUT:
+                # Bound closure too: a stalled transport must not hold the
+                # monitor indefinitely after its probe has timed out.
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        state.ws.close(code=1013, reason="Probe did not complete"),
+                        timeout=5.0,
+                    )
+                return
+
+            old = flow.mode
+            log_mode(state, now)
+            if flow.mode is not old:
+                state.wake.set()
+
+            # Ping after sending: the pong only returns once the client has
+            # read up to here, which is how flow control sees its lag.
+            # In short, the pong is how quickly the client is consuming data.
+            # Run independently of sending, including during idle periods and
+            # history transfer. Only one ping operation may be outstanding.
+            if probe_task is None and flow.should_probe(now):
+                probe_started = now
+                flow.on_probe(now)
+                probe_task = asyncio.create_task(measure_ping(state))
+
+            await asyncio.sleep(MONITOR_INTERVAL)
+    except websockets.ConnectionClosed:
+        pass
+    finally:
+        if probe_task is not None:
+            probe_task.cancel()
+            await asyncio.gather(probe_task, return_exceptions=True)
 
 # client_sender is the dedicated sending loop to one browser client. As a whole, 
 # the purpose is to ensure that a slow client does not block the source or other clients.
@@ -192,14 +254,6 @@ async def client_sender(state: ClientState) -> None:
                     state.pending_active = None
                 # Only this per-client task sends through that client's WebSocket.
                 await state.ws.send(json.dumps(caption_to_dict(caption)))
-                # Ping after sending: the pong only returns once the client has
-                # read up to here, which is how flow control sees its lag.
-                # In short, the pong is how quickly the client is consuming data.
-                probe_now = time.monotonic()
-                if flow.should_probe(probe_now):
-                    flow.on_probe(probe_now)
-                    pong = await state.ws.ping()
-                    pong.add_done_callback(lambda fut: on_pong(state, fut))
     except websockets.ConnectionClosed:
         pass  # handle_client's finally does the cleanup
 
@@ -304,6 +358,8 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
           f"history={len(items)}; clients={len(clients)}", flush=True)
 
     try:
+        # Start before history transfer so a blocked send cannot stop probing.
+        state.monitor = asyncio.create_task(client_monitor(state))
         await ws.send(json.dumps({"type": "HISTORY",
                                   "items": [caption_to_dict(c) for c in items]}))
         # The current draft (if any) follows as a normal CAPTION_UPDATE.
@@ -318,6 +374,10 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
     finally:
         clients.pop(ws, None)
         overloaded_clients.discard(ws)
+        if state.monitor is not None:
+            state.monitor.cancel()
+            with suppress(asyncio.CancelledError):
+                await state.monitor
         if state.sender is not None:
             state.sender.cancel()
             with suppress(asyncio.CancelledError):
