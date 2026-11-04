@@ -1,12 +1,8 @@
-// As a whole, this file contians the browser-side logic for LiveRecall. 
-// It is responsible for:
-// 1. Connecting the browser to the WebSocket server. 
-// 2. Receiving and display live caption updates. 
-// 3. Handling caption revisions, alongside finalised captions. 
-// 4. Managing reconnect recovery and missed-caption history. 
-// 5. Providing the recall panel, scrolling and resize controls.
+// Browser-side logic for LiveRecall.
+// This covers connection management and caption rendering.
+// It also covers recovery and panel controls.
 
-// declare constants
+// DOM references and client-side configuration.
 const WS_URL = "ws://127.0.0.1:8765";
 const statusEl = document.getElementById("status");
 const liveEl = document.getElementById("live");
@@ -20,14 +16,14 @@ const recallOpenButton = document.getElementById("recall-open");
 const recallWindowButtons = document.querySelectorAll("button[data-seconds]");
 const recallLatestButton = document.getElementById("recall-latest");
 
-// As a whole, all of these variables store the browser client's connection, caption and UI state.
+// Connection state and caption state for this browser tab.
 let ws; // Stores the current WebSocket connection to the server. 
 let lastFinal = { segment: 0, revision: 0 }; // Tracks the newest finalised caption that is received.
 let retryAttempt = 0; // Tracks reconnect attempts and the timer used before trying again.
 let retryTimer = null;
 let resumeFrom = 0; // last final segment this connection resumed from (0 = fresh join)
 let noticeTimer = null; // Stores the timer for temporary notices
-let recallSeconds = 30; // Controls the selected recall window: 15, 30, or 60 seconds
+let recallSeconds = 30; // Controls the selected recall window.
 let recallFollow = false; // whether recall follows newly arriving captions
 let recallJumping = false; // smooth scroll to the newest caption in progress
 const recallRows = new Map(); // segment -> row in the recall list
@@ -36,28 +32,27 @@ const elements = new Map(); // segment -> DOM element
 let latestLiveElement = null;
 const KEEP_SECONDS = 90; // messages beyond KEEP_SECONDS ago are no longer stored in device
 
-// It gives each browser tab a temporary numeric client ID. 
+// Give each browser tab a temporary numeric client ID.
 function numericClientId() {
   const key = "liverecall-client-id";
   // Defines the sessionStorage key used to save the ID.
   let value = sessionStorage.getItem(key);
   if (!value) {
-    // Checks whether the browser already has an ID. If no ID exists, a random six-digit number is stored.
+    // Reuse the tab's ID when possible; otherwise create and store one.
     value = String(Math.floor(100000 + Math.random() * 900000));
     sessionStorage.setItem(key, value);
   }
   return Number(value);
 }
 
-// Converts a caption's Unix timestamp into a readable clock time. 
-// Is mainly for finalised captions, as provisional captions will only display "now".
+// Convert a caption's Unix timestamp into a readable clock time.
 function captionTime(caption) {
   return new Date(caption.source_ts * 1000).toLocaleTimeString([], {
     hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
   });
 }
 
-// As a whole, it is meant to update a caption row in the browser interface.
+// Update the visible live-caption row.
 function fillCaptionRow(row, caption) {
   row.className = "caption-row " + (caption.final ? "final-line" : "provisional-line");
   const time = document.createElement("span");
@@ -69,24 +64,23 @@ function fillCaptionRow(row, caption) {
   row.replaceChildren(time, text);
 }
 
-// This is in charge of refreshing the "What did I miss?" panel
-// while perserving the user's scrolling position. 
+// Refresh the recall panel while preserving the user's reading position.
 function renderRecall() {
   if (recallPanel.hidden) return;
   const cutoff = Date.now() / 1000 - recallSeconds;
 
-  // It gets the latest caption for every segment, keeps finalised captions only, 
-  // removes captions older than the selected window and sorts them chronologically.
+  // Keep the newest finalised caption per segment.
+  // Apply the selected time window
+  // and render the results in chronological order.
   const items = [...captions.values()]
     .filter(c => c.final && c.source_ts >= cutoff)
     .sort((a, b) => a.segment - b.segment);
   // Identify captions still inside of the window.
   const inWindow = new Set(items.map(c => c.segment));
 
-  // Update the list in place instead of rebuilding
-  // so a user who scrolled up keeps their place. 
+  // Update rows in place so a user who is reading older captions keeps their place.
   //
-  // For rows that left the window, remove them and
+  // For rows that left the window remove them and
   // scroll up by their height so the text being read
   // does not move
   let removedHeight = 0;
@@ -103,7 +97,7 @@ function renderRecall() {
   // Hide the button if the user is no longer following the newest caption.
   recallLatestButton.hidden = recallFollow;
 
-  // Add new captions, in segment order.
+  // Add new captions in segment order.
   for (const caption of items) {
     if (recallRows.has(caption.segment)) continue;
     const row = document.createElement("div");
@@ -131,7 +125,7 @@ function updateLatestButton() {
 }
 
 // Follow the newest caption while the user is at the bottom. Then stop as soon as
-// they scroll up to read, and resume when they scroll back down.
+// they scroll up to read and resume when they scroll back down.
 recallEl.addEventListener("scroll", () => {
   if (recallJumping) return;
   recallFollow =
@@ -162,7 +156,8 @@ recallLatestButton.addEventListener("click", () => {
   setTimeout(finishRecallJump, 1000); // fallback where "scrollend" is not supported
 });
 
-// Returns true if the caption was applied, false if it was stale or a duplicate.
+// Apply a caption if it is newer than the stored revision for that segment.
+// Return false for stale or duplicate updates.
 function applyCaption(msg) {
   const existingCaption = captions.get(msg.segment)
   
@@ -178,15 +173,14 @@ function applyCaption(msg) {
 
   // Stores the accepted caption as the latest version of the segment
   captions.set(msg.segment, msg)
-  // Finals captions are added to the recall panel since recall only displays finalised captions
+  // Recall contains finalised captions only.
   if (msg.final) {
       renderRecall()
     }
-  // Sees whether a DOM row already exists
+  // Reuse an existing row when this segment already has a rendered entry.
   let line = elements.get(msg.segment)
 
-  // Creates a new row for a previously unseen segment. 
-  // If the row already exists, it is reused for the newer revision.
+  // Create a row for a new segment; revisions update the existing row.
   if (!line) {
     line = document.createElement("div");
     elements.set(msg.segment, line);
@@ -210,22 +204,22 @@ function applyCaption(msg) {
   return true
 }
 
-// Displays a temporary status message in the interface.
+// Display a temporary status message in the interface.
 function showNotice(text) {
   noticeEl.textContent = text;
   noticeEl.hidden = false;
   clearTimeout(noticeTimer);
-  // Start a new six-second timer; after six seconds, the notice is hidden automatically.
+  // Start a six-second timer.
+  // The notice is then hidden automatically.
   noticeTimer = setTimeout(() => { noticeEl.hidden = true; }, 6000);
 }
 
-// Schedules a new WebSocket connection after the current connection fails.
+// Schedule a reconnect after the current WebSocket connection fails.
 function scheduleReconnect() {
   if (retryTimer !== null) return;
 
-  // make each failed attempt wait longer (exponential backoff): 0.5s, 1s, 2s up to 10s max,
-  // randomised between half and the full step so clients that dropped
-  // together don't all reconnect at the same moment
+  // Increase the delay after repeated failures and add jitter so clients that
+  // disconnect together do not all reconnect at exactly the same time.
   const cap = Math.min(10000, 500 * 2 ** retryAttempt++);
   const delay = cap / 2 + Math.random() * (cap / 2);
   statusEl.textContent = `Reconnecting in ${(delay / 1000).toFixed(1)} s (attempt ${retryAttempt})`;
@@ -236,21 +230,18 @@ function scheduleReconnect() {
   }, delay);
 }
 
-// As a whole, it establishes the browser's WebSocket connection to the LiveRecall server.
+// Establish the browser's WebSocket connection to the LiveRecall server.
 function connect() {
   statusEl.textContent = 
   lastFinal.segment === 0 ? "Connecting…" : "Reconnecting…";
 
-  // Creates the WebSocket.
-  // Opens a connection to the server URL, like ws://127.0..0.1:8765.
+  // Open a connection to the configured server URL.
   ws = new WebSocket(WS_URL);
 
-  // Once connected, updates the UI to show that the client is live.
+  // Mark the client as live and send its recovery checkpoint.
   ws.addEventListener("open", () => {
     statusEl.textContent = "● Live";
-    // Stores the segment from which this connection is resuming.
     resumeFrom = lastFinal.segment;
-    // Sends the client a hello.
     ws.send(JSON.stringify({
       type: "CLIENT_HELLO",
       client_id: numericClientId(),
@@ -261,35 +252,35 @@ function connect() {
     }));
   });
 
-  // Runs whenever the server sends a message and converts the JSON text into a JavaScript object.
+  // Handle each server message after decoding its JSON payload.
   ws.addEventListener("message", (event) => {
     const msg = JSON.parse(event.data);
-    // Passes live drafts and final captions, in which validates the revision and updates the live
-    // caption display.
+      // Apply both provisional and finalised caption updates through the same
+      // revision-aware rendering path.
     if (msg.type === "CAPTION_UPDATE") {
       applyCaption(msg);
     } else if (msg.type === "HISTORY") {
       // Logs the number of recovered items for debugging.
       console.log(`HISTORY with ${msg.items?.length ?? 0} item(s)`, msg);
-      // merge history without stale/duplicate final captions.
+      // Merge recovered history through the same deduplication logic.
       let recovered = 0;
       for (const item of msg.items ?? []) {
         if (applyCaption(item) && item.final) recovered++;
       }
 
-      // Tell the user what recovery did.
-      // If the client had already been connected, it shows a reconnect message. 
+      // Tell the user whether reconnect recovery found missed captions.
+      // If the client was already connected show a reconnect message.
       const s = recovered === 1 ? "" : "s";
       if (resumeFrom > 0) {
         showNotice(recovered > 0
           ? `Reconnected: recovered ${recovered} missed caption${s}, no duplicates.`
           : "Reconnected. Nothing was missed.");
       } else if (recovered > 0) {
-        // Else, if it is a new client.
+        // Otherwise the client has joined during the lecture.
         showNotice(`Joined mid-lecture: loaded ${recovered} earlier caption${s}.`);
       }
 
-      // Displays the source's currently active provision caption, if one exists.
+      // Render the source's current provisional caption when one exists.
       if (msg.active) {
         applyCaption(msg.active)
       }
@@ -298,10 +289,10 @@ function connect() {
     }
   });
 
-  // Runs when the WebSocket closes
+  // Reconnect after the WebSocket closes.
   ws.addEventListener("close", () => {
     statusEl.textContent = "Connection lost";
-    // automatic reconnect after a short delay, using finalized resume state.
+  // Resume from the latest finalised checkpoint after a backoff delay.
     scheduleReconnect();
   });
 
@@ -311,10 +302,10 @@ function connect() {
   });
 }
 
-// As a whole, this changes the amount of history in which is shown in the recall panel.
+// Change the amount of history shown in the recall panel.
 function setRecallWindow(seconds, followLatest = true) {
   recallSeconds = seconds;
-  // Stores the selected duration, such as 15, 30, or 60.
+  // Store the selected duration.
   recallFollow = followLatest;
 
   // Marks the duration as active for styling and accessibility
@@ -329,7 +320,7 @@ function setRecallWindow(seconds, followLatest = true) {
   renderRecall();
 }
 
-// "What did I miss?" opens on demand and always starts at the 30-second view
+// Open the recall panel at its default 30-second view.
 function openRecall() {
   // Opens the recall panel and sets the initial view
   recallPanel.hidden = false;
@@ -343,8 +334,7 @@ function openRecall() {
   });
 }
 
-// Closes the "What did I miss?" recall panel; upon reopening the panel, you can see the existing 
-// recent history again.
+// Close the recall panel without clearing the locally retained history.
 function closeRecall() {
   // Hides the recall panel and its caption list.  
   recallPanel.hidden = true;
@@ -352,9 +342,7 @@ function closeRecall() {
   recallOpenButton.setAttribute("aria-expanded", "false");
 }
 
-// As a whole, makes the "What did I miss?" button act as a toggle:
-// If the panel is closed, open it; 
-// If the panel is open, close it. 
+// Toggle the recall panel when its open button is clicked.
 recallOpenButton.addEventListener("click", () => {
   if (recallPanel.hidden) {
     openRecall();
@@ -365,18 +353,19 @@ recallOpenButton.addEventListener("click", () => {
 // Closing with the panel's close button.
 document.getElementById("recall-close").addEventListener("click", closeRecall);
 
-// Adds behaviour to the 15s, 30s and 60s buttons; when clicked, the selected duration is passed
-// to the setRecallWindow();
+// Connect the recall buttons to setRecallWindow().
 for (const button of recallWindowButtons) {
   button.addEventListener("click", () => setRecallWindow(Number(button.dataset.seconds)));
 }
 
-// Resizing the recall panel by dragging the divider.
-// The width is kept between visits (width stored in local storage) and the live captions take the rest.
+// Resize the recall panel by dragging its divider. The selected width is
+// The width is persisted locally.
+// The remaining space belongs to the live-caption view.
 const RECALL_MIN_WIDTH = 260;
 const RECALL_WIDTH_KEY = "liverecall-recall-width";
 
-// Sets and saves the recall panel's width
+// Clamp the recall panel width.
+// Apply the width and persist it locally.
 function setRecallWidth(px) {
   // Defines a function that applies a new width to the recall panel and save it for future visits.
   const width = Math.round(Math.min(Math.max(px, RECALL_MIN_WIDTH), appMainEl.clientWidth * 0.6));
@@ -391,7 +380,8 @@ dividerEl.addEventListener("pointerdown", (event) => {
   dividerEl.setPointerCapture(event.pointerId);
   document.body.classList.add("resizing");
 
-  // The recall panel is on the right, so dragging left makes it wider.
+  // The recall panel is on the right.
+  // Dragging left makes it wider.
   const onMove = (e) => setRecallWidth(startWidth + startX - e.clientX);
   // Stops tracking pointer movement and restores normal cursor/text-selection behaviour.
   const onEnd = () => {
@@ -405,16 +395,17 @@ dividerEl.addEventListener("pointerdown", (event) => {
   event.preventDefault();
 });
 
-// Reads the previously saved panel width from localStorage and applies it when the page loads.
+// Restore the previously saved panel width when the page loads.
 try {
   const saved = Number(localStorage.getItem(RECALL_WIDTH_KEY));
   if (saved > 0) appMainEl.style.setProperty("--recall-width", `${saved}px`);
 } catch {}
 
-// Calculates the timestamp for the oldest caption the browser should retain.
+// Remove locally retained captions older than the browser's recall window.
 function pruneOldCaptions() {
   const cutoff = Date.now() / 1000 - KEEP_SECONDS;
-  // Removes captions older than 90 seconds from: the browser's caption map, the live-caption DOM, the element lookup map
+  // Remove old captions from the caption map.
+  // Remove the matching live row and element reference.
   for (const [segment, caption] of captions) {
     if (caption.source_ts < cutoff) {
       captions.delete(segment);
@@ -424,11 +415,11 @@ function pruneOldCaptions() {
   }
 }
 
-// every second: drop old captions, and keep the recall view current while it is open
+// Periodically prune old captions and refresh the open recall view.
 setInterval(() => {
   pruneOldCaptions();
   renderRecall();
 }, 1000);
 
-// starts the initial WebSocket connection to the LiveRecall server.
+// Start the initial WebSocket connection.
 connect();
