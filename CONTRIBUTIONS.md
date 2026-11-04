@@ -2,7 +2,7 @@
 
 | Member | Main responsibilities | Experiments/report sections | Agreed contribution % |
 |---|---|---|---:|
-| Lim Jinle, Alexius | shared flow-control design and integration |  | 25 |
+| Lim Jinle, Alexius |  flow-control |  | 25 |
 | Ong Li Min | client logic and UI | architectural and protocol, limitations, conclusion and future work | 25 |
 | James Chin Jia Jun | revision replacement |  | 25 |
 | Tey Kai Jie | reconnection |  | 25 |
