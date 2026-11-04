@@ -19,6 +19,9 @@ and fix certain bugs in regards to the flow control. Mainly the monitoring
 system and how pings were sent out. Again no generated change was accepted 
 without verification and fact-checking.
 
+Lastly, Codex helped to generate `tools/run_t1_t4.py` and `tools/run_t5.py`  
+for better automated testing and collating of median values 
+
 Claude Code generated `tools/slow_proxy.py`, the throttling TCP
 proxy used to demonstrate flow control with real browser tabs. It was needed
 because a busy browser tab still answers WebSocket pings on time, so slowing
