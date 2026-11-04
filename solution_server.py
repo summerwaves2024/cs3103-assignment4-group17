@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-This WebSocket server accepts caption updates from the deterministic source,
-validates revisions, keeps bounded finalised-caption history, and delivers
-updates to browser clients with per-client flow control and reconnect recovery.
+This is the fully implemented WebSocket broadcaster in which accepts caption 
+updates from the determinstic source, validates revisions, maintains bounded
+finalised-caption history and broadcasts updates to browse clients
+with per-client flow control and reconnect recovery. 
 
 As per the assignment specifications, it can be run with this command:
     python solution_server.py --port 8765
@@ -24,41 +25,43 @@ from revision_state_manager import RevisionStateManager
 import websockets
 from websockets.asyncio.server import ServerConnection
 
-HISTORY_KEEP_SECONDS = 90  # How long finalised captions remain available for recovery.
-MAX_HISTORY_SECONDS = 60  # Maximum history window a client may request.
-DEFAULT_HISTORY_SECONDS = 30  # Default recall window when the client omits one.
-MAX_PENDING_FINALS = 256  # Maximum per-client finalised-caption backlog.
+HISTORY_KEEP_SECONDS = 90 # how long the server keeps finaslied captions 
+MAX_HISTORY_SECONDS = 60 # the maximum history a client can request 
+DEFAULT_HISTORY_SECONDS = 30 # default/recall window when the client does not specify one
+MAX_PENDING_FINALS = 256  # maximum for per-client finalized-caption backlog
+PROBE_TIMEOUT = 20.0     # Includes blocked ping setup as well as a missing pong.
 
 
 
-finals_log: deque[Caption] = deque()  # Final captions in segment order.
-active: Caption | None = None  # Newest provisional caption for the current segment.
-clients: dict[ServerConnection, ClientState] = {}  # Client state keyed by socket.
+finals_log: deque[Caption] = deque()  # finals in segment order, trimmed to HISTORY_KEEP_SECONDS
+active: Caption | None = None          # newest draft of the current segment
+clients: dict[ServerConnection, ClientState] = {} # keyed by socket
 overloaded_clients: set[ServerConnection] = set()
-rsm: RevisionStateManager | None = None  # Created when the source first connects.
+rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO
 
-# Parse and validate one caption update received from the source.
+# In charge of parsing and validating an incoming caption message from the original source.
 def parse_caption(msg: dict[str, Any]) -> Caption | None:
     try:
-        # Convert fields to the types used by the server.
+        # Converts to the expected types. 
         caption = Caption.from_dict(msg)
         caption.segment = int(caption.segment)
         caption.revision = int(caption.revision)
         caption.source_ts = float(caption.source_ts)
     except (TypeError, ValueError):
-        # Invalid field types mean this message cannot be processed safely.
         return None
-    # Reject invalid revision numbers and non-string caption text.
+    # Rejects revisions below 1 and ensures the caption text is a string. 
     if caption.revision < 1 or not isinstance(caption.text, str):
         return None
-    # Normalise the final flag before revision processing.
+    # Converts the final-status field to a Boolean. 
     caption.final = bool(caption.final)
     return caption
 
-# Convert an internal caption into the public WebSocket message format.
+# Converts an internal Caption object into a JSON-compatible 
+# dictionary for WebSocket transmission. 
+# By sending only the necessary things, it ensures that the message
+# is small and avoids exposing unnecessary server-side data. 
 def caption_to_dict(caption: Caption) -> dict[str, Any]:
     """only forward the necessary fields"""
-    # Keep the wire format explicit so internal server state is not exposed.
     return {
         "type": "CAPTION_UPDATE",
         "session": caption.session,
@@ -69,60 +72,52 @@ def caption_to_dict(caption: Caption) -> dict[str, Any]:
         "text": caption.text,
     }
 
-# Remove finalised captions outside the recovery window and prune their
-# corresponding revision state from the manager.
+#  Drop finals older than the 90-second recovery window and prune their 
+#  corresponding revision state. 
 def trim_finals_log(now: float) -> None:
-    # Store the oldest segment removed during this pass for RSM pruning.
     pruned_seg = 0
-    # Entries are timestamp-ordered.
-    # Old captions can therefore be removed from the left.
+    # while finals_log is not empty and the oldest finalised caption is more than 90 seconds
     while finals_log and finals_log[0].source_ts < now - HISTORY_KEEP_SECONDS:
         pruned_seg = max(pruned_seg, finals_log.popleft().segment)
     if pruned_seg:
-        # Discard revision state that can no longer be recovered.
+        # Remove the oldest caption from the left side of the deque 
         rsm.prune(pruned_seg)
 
-# Make the newest provisional revision available to every connected client.
+# In short, it handles a new provisional caption from the original source
+# and distributes the latest version to every client.
 def on_draft(caption: Caption) -> None:
     global active
-    # The global active value is used when a new client joins mid-segment.
     active = caption
-
+    # Stores the newest draft globally; as a segment can only receive multiple revision, 
+    # one should note only the last matters 
     for state in clients.values():
-        # Drafts are replaceable.
-        # Retain only the newest unsent revision.
+        # Updates every connected browser client by itself.
         if state.pending_active is not None:
             state.drafts_dropped += 1
-
-        # Replace the client's pending draft with the newest revision.
+        # If a previous draft was waiting to be sent, it is now obsolete since a newer draft arrived.
         state.pending_active = caption
-
-        # Notify the sender task that work is available.
+        # Replaces the client's draft with the newest one.
         state.wake.set()
 
-# Queue a finalised caption for recovery and delivery to each client.
+# This handles a finalised caption from the original source.
 def on_final(caption: Caption) -> None:
     global active
-    # Trim history before adding the new finalised caption.
+    # First, it removes finalised captions older than the history window.
     trim_finals_log(caption.source_ts)
-    # Keep the caption for reconnect and late-join recovery.
+    # Tries to store the new final caption for reconnect and late-join recovery.
     finals_log.append(caption)
 
-    # If the finalised caption belongs to the active segment
-    # clear the global draft because that segment is complete.
+    # If the finalised caption originally belongs to the current active segment, 
+    # the global draft is cleared since that segment is complete.
     if active is not None and active.segment == caption.segment:
         active = None
-    # Each client has an independent queue and sender task.
+    # Processes every connected client independently.
     for state in clients.values():
-        # A client that is already being closed is no longer a delivery target.
         if state.ws in overloaded_clients:
             continue
-        # Final captions must not be silently dropped. If this queue is too
-        # large close the client.
-        # Reconnect recovery can then fill the gap.
         if len(state.pending_finals) >= MAX_PENDING_FINALS:
-            # Do not silently discard finalised captions. Close an excessively
-            # delayed client so it can reconnect and recover from finals_log.
+            # Do not silently drop finalized captions. Close an excessively
+            # delayed client so it reconnects and recovers from finals_log.
             overloaded_clients.add(state.ws)
             state.pending_active = None
             print(f"client too far behind: id={state.client_id}; "
@@ -131,61 +126,124 @@ def on_final(caption: Caption) -> None:
                 state.ws.close(code=1013, reason="Client too far behind")
             )
             continue
-        # Queue this final independently for this specific client.
         state.pending_finals.append(caption)
         # The final supersedes any unsent draft of the same segment.
         if state.pending_active is not None and state.pending_active.segment == caption.segment:
             state.pending_active = None
-        # Wake the sender so it can deliver the final immediately.
+        # Wakes the client's sender task so it can send the final caption.
         state.wake.set()
 
-# Log a flow-control transition when the state changes.
+# Used for logging with respect to the flow control. 
 def log_mode(state: ClientState, now: float) -> None:
-    # update_mode() returns the previous mode only when a transition occurred.
+    # Print the client's flow-control state whenever it changes.
     old = state.flow.update_mode(now)
+    # Prevents repeated logs when the client is in the same state
     if old is not None:
-        # flush=True makes transitions visible immediately during experiments.
+        # Also prints the transitions such as client client-3: NORMAL -> BEHIND
+        # As a side note, flush=True makes the message appear immediately in the terminal
         print(f"client {state.client_id}: {old.name} -> {state.flow.mode.name}", flush=True)
 
-# Process completion of an application-level ping used for RTT monitoring.
+# As a whole, it is called when a client replies to the server's ping.
 def on_pong(state: ClientState, future: asyncio.Future) -> None:
-    # Ignore failed or cancelled ping operations.
+    # Ignores the failed or cancelled pong operations
     if future.cancelled() or future.exception() is not None:
         return
-    # Monotonic time is appropriate for elapsed-time measurements.
+    # Monotonic processing time is used for restriction deadlines.
     now = time.monotonic()
-    # Let flow control update RTT estimates and determine the current mode.
-    state.flow.on_pong(now)
+    # Classify lateness using the library RTT, not elapsed probe-task time.
+    state.flow.on_pong(now, rtt=future.result())
+    # If state has changed, print a message.
     log_mode(state, now)
-    # A pong may release a held draft.
-    # Wake the sender so it can re-check the draft.
+    # Wake up the sender so that it can recheck whether a held draft can be resent.
     state.wake.set()
 
-# Send updates to one browser client without blocking the source or other clients.
-async def client_sender(state: ClientState) -> None:
-    # This is the only task that calls ws.send for this client. Finalized
-    # captions are sent in order before any provisional draft.
+async def measure_ping(state: ClientState) -> float:
+    """Use library RTT, including queue/network delay but not monitor scheduling."""
+    pong = await state.ws.ping()
+    # The library owns this future. Consume failures even after cancellation,
+    # and shield it so stopping the monitor doesn't cancel library state.
+    pong.add_done_callback(
+        lambda future: None if future.cancelled() else future.exception()
+    )
+    return await asyncio.shield(pong)
+
+
+async def client_monitor(state: ClientState) -> None:
+    """Keep checking flow state while one independent task measures a ping."""
+    probe_task = None
+    probe_started = None
     flow = state.flow
     try:
         while True:
-            # Sleep until a caption or flow-control event makes work available.
+            now = time.monotonic()
+            if probe_task is not None and probe_task.done():
+                # Surface connection failures to the monitor's cleanup rather
+                # than leaving the controller with an outstanding probe.
+                probe_task.result()
+                on_pong(state, probe_task)
+                probe_task = None
+                probe_started = None
+
+            if probe_started is not None and now - probe_started >= PROBE_TIMEOUT:
+                # Bound closure too: a stalled transport must not hold the
+                # monitor indefinitely after its probe has timed out.
+                with suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        state.ws.close(code=1013, reason="Probe did not complete"),
+                        timeout=5.0,
+                    )
+                return
+
+            old = flow.mode
+            log_mode(state, now)
+            if flow.mode is not old:
+                state.wake.set()
+
+            # Ping shares the ordered transport with captions, so its RTT can
+            # reflect queued caption bytes as well as network/peer delay.
+            # A pong does not establish that caption JavaScript has run.
+            # Run independently of sending, including during idle periods and
+            # history transfer. Only one ping operation may be outstanding.
+            if probe_task is None and flow.should_probe(now):
+                # Overall task age is used only for the hard liveness timeout.
+                probe_started = now
+                flow.on_probe(now)
+                probe_task = asyncio.create_task(measure_ping(state))
+
+            await asyncio.sleep(MONITOR_INTERVAL)
+    except websockets.ConnectionClosed:
+        pass
+    finally:
+        if probe_task is not None:
+            probe_task.cancel()
+            await asyncio.gather(probe_task, return_exceptions=True)
+
+# client_sender is the dedicated sending loop to one browser client. As a whole, 
+# the purpose is to ensure that a slow client does not block the source or other clients.
+async def client_sender(state: ClientState) -> None:
+    ## Per-client sender: every final in order, then only the newest draft.
+    # This is the only place that awaits ws.send for this client, so a slow
+    # client never blocks the source or the other clients.
+    flow = state.flow
+    try:
+        while True:
+            # Sender sleeps until a new draft, final caption or even pong wakes it up
             await state.wake.wait()
             state.wake.clear()
-            # Drain all currently available work before waiting again.
             while state.pending_finals or state.pending_active is not None:
                 now = time.monotonic()
-                # Finalized captions are mandatory and take priority.
+                # send unsent finals first (from oldest to newest)
                 if state.pending_finals:
-                    # popleft() preserves finalised-caption order.
                     caption = state.pending_finals.popleft()
-                # Only send a draft after the finalised queue is empty.
+                # if no more finals left to send, send the actively changing one
                 else:
                     log_mode(state, now)
-                    # Flow control decides whether the draft may be sent now.
+                    # If there are no pending finals, it checks flow control.
                     delay = flow.draft_delay(now)
                     if delay is None or delay > 0:
-                        # Hold the draft while the client is behind. A newer draft
-                        # may replace it before the delay expires.
+                        # Client is behind: hold the draft (a newer one may replace
+                        # it). Wait `delay` seconds, or with no timeout (None) until
+                        # woken by the pong, a new final or a new draft.
                         try:
                             await asyncio.wait_for(state.wake.wait(), delay)
                         except asyncio.TimeoutError:
@@ -194,92 +252,84 @@ async def client_sender(state: ClientState) -> None:
                         continue
                     caption = state.pending_active
                     state.pending_active = None
-                # Removing a draft before sending prevents the same draft from
-                # being sent twice if a newer source update wakes this task.
                 # Only this per-client task sends through that client's WebSocket.
                 await state.ws.send(json.dumps(caption_to_dict(caption)))
-                # Probe periodically after a send. The resulting pong provides
-                # an application-level indication of client responsiveness.
-                probe_now = time.monotonic()
-                if flow.should_probe(probe_now):
-                    # Mark the probe before waiting for its pong so another
-                    # probe cannot be started while this one is outstanding.
-                    flow.on_probe(probe_now)
-                    pong = await state.ws.ping()
-                    # The callback records the RTT when the pong arrives.
-                    pong.add_done_callback(lambda fut: on_pong(state, fut))
     except websockets.ConnectionClosed:
         pass  # handle_client's finally does the cleanup
 
-# Receive and process the connection from caption_source.py.
+# As a whole, it manages the connection from caption_source.py. 
 async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
     global rsm
-    # Read the lecture/session identifier from SOURCE_HELLO.
+    # Reads the lecture/session identifier from the source's initial hello message
     session = hello.get("session")
     print(f"source connected: session={session}", flush=True)
 
-    # Keep one revision manager for the server lifetime so a reconnecting
-    # source cannot reintroduce stale updates.
+    # One manager for the lifetime of the server, so a reconnecting source
+    # can't re-send segments that clients already hold.
     if rsm is None:
         rsm = RevisionStateManager(session)
 
     try:
-        # Source input is handled independently from each browser sender.
+        # Waits for the caption messages from the source without blocking the browser clients.
+        # Without handling, the server might wait for the source and then delay/block messages 
+        # to the browser clients.
         async for raw in ws:
             try:
-                # Ignore malformed JSON rather than terminating the server.
+                # Malformed JSON is thereby ignored so that the server does not crash.
                 msg = json.loads(raw)
             except json.JSONDecodeError:
                 continue
 
             msg_type = msg.get("type")
-            # Validate and accept only well-formed caption updates.
+            # For caption updates, it validates and then converts the raw message into a Caption.
             if msg_type == "CAPTION_UPDATE":
                 caption = parse_caption(msg)
                 if caption is None:
                     print(f"dropped malformed update: {raw!r:.120}", flush=True)
                     continue
-                # Reject duplicates and stale revisions.
+                # Checks whether the caption is a valid newer revision. 
                 is_accepted, _ = rsm.process_caption(caption)
                 if not is_accepted:
                     continue
 
                 if caption.final:
-                    # Finalized captions enter history and every client queue.
                     on_final(caption)
                 else:
-                    # Provisional captions update only the replaceable draft.
                     on_draft(caption)
             elif msg_type == "SOURCE_DONE":
-                # SOURCE_DONE is a test-control message; clients do not need it.
+                # Test-control message. The specification does not require it
+                # to be forwarded to clients.
                 print("source finished", flush=True)
             else:
-                # Ignore unknown message types for forward compatibility.
+                # Forward compatibility: ignore fields/messages this baseline
+                # doesn't understand rather than crashing.
                 continue
     except websockets.ConnectionClosed:
-        pass  # Clients can still reconnect and recover from bounded history.
+        pass  # abrupt source drop: clients keep being served from history
     finally:
         print("source disconnected", flush=True)
 
-# Select finalised captions for a reconnecting or late-joining client.
+# It selects the finalised captions in order to send it to a 
+# reconnecting or late-joining client. 
 def history_items(last_segment: int, last_revision: int,
                   history_seconds: float, now: float) -> list[Caption]:
-    # Restrict recovery to the requested time window.
+    # Calculating the oldest timestamp that should still be included.
     cutoff = now - history_seconds
-    # Resume after the client's checkpoint and avoid duplicates. A newer
-    # revision of the same segment is also eligible for recovery.
+    # Returns only captions that satisfy both conditions:
+    # c.segment > last_segment, or the same segment with a newer revision.
+    # c.source_ts >= cutoff: the caption is within the requested history window.
+
+    # This essentially prevents duplicate captions during reconnect. Additionally, it 
+    # also avoids sending captions older than the selected recall period.
     return [c for c in finals_log
             if (c.segment > last_segment
                 or (c.segment == last_segment and c.revision > last_revision))
             and c.source_ts >= cutoff]
 
 async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
-    # CLIENT_HELLO carries the client's last finalised checkpoint. The server
-    # uses it to send only captions the client may have missed.
     client_id = hello.get("client_id")
 
     try:
-        # Normalise the checkpoint and requested history window from the hello.
         last_segment = max(0, int(hello.get("last_segment") or 0))
         last_revision = int(hello.get("last_revision") or 0)
         history_seconds = float(hello.get("history_seconds", DEFAULT_HISTORY_SECONDS))
@@ -288,14 +338,11 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         return
     history_seconds = min(max(history_seconds, 0), MAX_HISTORY_SECONDS)
     if last_segment > 0:
-        # A reconnecting client receives the maximum recoverable window.
-        # rather than a short first-join recall window.
+        # Resuming client: recover every final it missed (capped at 60 s),
         history_seconds = MAX_HISTORY_SECONDS
 
     items = history_items(last_segment, last_revision,
                           history_seconds, time.time())
-    # Recover the current provisional caption separately from finalised history.
-    # It is sent only when it is newer than the client's checkpoint.
     pending = (
         active
         if active is not None
@@ -305,33 +352,26 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         else None
     )
     state = ClientState(ws=ws, pending_finals=deque(),
-                        pending_active=pending,
-                        client_id=client_id)
-    # Register the client before live source updates can be distributed to it.
+                        pending_active=pending, client_id=client_id)
     clients[ws] = state
     print(f"client connected: id={client_id}; last_segment={last_segment}; "
           f"history={len(items)}; clients={len(clients)}", flush=True)
 
     try:
-        # Send the recovery snapshot before starting live delivery so the
-        # client receives missed finalised captions in a predictable order.
+        # Start before history transfer so a blocked send cannot stop probing.
+        state.monitor = asyncio.create_task(client_monitor(state))
         await ws.send(json.dumps({"type": "HISTORY",
                                   "items": [caption_to_dict(c) for c in items]}))
-        # Start the sender after the recovery snapshot; any active draft follows
-        # as a normal CAPTION_UPDATE.
+        # The current draft (if any) follows as a normal CAPTION_UPDATE.
         state.sender = asyncio.create_task(client_sender(state))
-        # The sender initially wakes to deliver any recovered active draft.
         state.wake.set()
-        # Clients normally send nothing after CLIENT_HELLO.
-        # Keep the socket
-        # open until the client disconnects.
+        # Student clients normally don't send further messages after hello.
+        # Keep the WebSocket open until the client disconnects.
         async for _ in ws:
             pass
     except websockets.ConnectionClosed:
         pass
     finally:
-        # Remove the client before cancelling its sender so new source updates
-        # cannot enqueue additional work for a socket that is closing.
         clients.pop(ws, None)
         overloaded_clients.discard(ws)
         if state.monitor is not None:
@@ -339,7 +379,6 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
             with suppress(asyncio.CancelledError):
                 await state.monitor
         if state.sender is not None:
-            # Stop and await the sender so it cannot outlive the connection.
             state.sender.cancel()
             with suppress(asyncio.CancelledError):
                 await state.sender
@@ -347,32 +386,35 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
               f"drafts_dropped={state.drafts_dropped}; "
               f"clients={len(clients)}", flush=True)
 
-# Route each new WebSocket connection after validating its initial hello.
+# Should be the first function called for ever new WebSocket connection / new client connection.
 async def handler(ws) -> None:
     try:
-        # Require the initial hello within five seconds.
+        # Waits for the intial hello and this must be sent within 5 seconds
         raw = await asyncio.wait_for(ws.recv(), timeout=5)
         # Converts the JSON message into a Python object.
         hello = json.loads(raw)
     except (asyncio.TimeoutError, json.JSONDecodeError, websockets.ConnectionClosed):
-        # Reject a timeout or invalid JSON.
-        # Reject a connection that closes before the hello.
+        # If the message times out, is invalid JSON or the connection closes, the server rejects it.
         await ws.close(code=1008, reason="Expected a valid hello message")
         return
     
-    # Route the connection according to the hello message type.
+    # Checks whether the decoded JSOn is an object and obtains its type. 
     msg_type = hello.get("type") if isinstance(hello, dict) else None
+    # Routes a caption source to handle_source()
     if msg_type == "SOURCE_HELLO":
         await handle_source(ws, hello)
+    # Routes a browser client to handle_client()
     elif msg_type == "CLIENT_HELLO":
         await handle_client(ws, hello)
     else:
-        # Reject connections that do not identify as a source or client.
+        # Else, it closes the connection as the message is not recognised
         await ws.close(code=1008, reason="Expected SOURCE_HELLO or CLIENT_HELLO")
 
-# Start the WebSocket server and keep it running.
+# As a whole, it starts and keeps the WebSockets server running.
 async def main_async(port: int) -> None:
-    # Bind on all interfaces and cap individual WebSocket messages at 1 MiB.
+    # Starts the server with the given port and binds to all the network interfaces.
+    # By having 2**20 for the max size, you limit the WebSocket message to 1 MiB, thereby 
+    # preventing unexpectedly large messages.
     async with websockets.serve(
         handler,
         "0.0.0.0",
@@ -382,10 +424,10 @@ async def main_async(port: int) -> None:
         ping_interval=None,
     ):
         print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
+        # Confirm that it started successfully.
         await asyncio.Future()
 
 def main() -> None:
-    # Keep command-line compatibility with the required server entry point.
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()

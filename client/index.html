@@ -24,8 +24,8 @@
       color: #172033;
     }
 
-    /* Keep the app inside the viewport: the header takes its natural height
-       and the main area fills the remaining space. */
+    /* The app fills the window and never grows: header, then the main area
+       takes the remaining height. */
     .app {
       height: 100vh;
       height: 100dvh;
@@ -66,7 +66,7 @@
       font-size: 0.9rem;
     }
 
-    /* Place the live-caption view and recall panel side by side. */
+    /* Live captions and "What did I miss?" side by side, sharing the height. */
     .app-main {
       flex: 1 1 auto;
       min-height: 0;
@@ -122,8 +122,8 @@
       min-width: 0;
     }
 
-    /* Keep live captions chronological and anchor the newest entries at the
-       bottom of the available viewport. */
+    /* Keep the live caption stream in normal chronological order while
+   anchoring the newest captions to the bottom of the viewport. */
     .live-viewport {
       flex: 1 1 auto;
       min-height: 0;
@@ -140,14 +140,14 @@
       justify-content: flex-end;
     }
 
-    /* app.js updates this width when the divider is dragged. */
+    /* Width set by dragging the divider (app.js sets --recall-width). */
     .recall-panel {
       position: relative;
       flex: 0 0 var(--recall-width, 360px);
       max-width: 60%;
     }
 
-    /* Divider between the live-caption and recall panels. */
+    /* Drag handle between the two panels; also the gap between them. */
     .divider {
       flex: 0 0 1.25rem;
       cursor: col-resize;
@@ -214,8 +214,8 @@
       color: #ffffff;
     }
 
-    /* The recall list is the scrollable region. app.js preserves the reading
-       position when rows are added or removed. */
+    /* The recall list is the one place that scrolls. app.js keeps the reading
+       position itself when old rows are removed, so native anchoring is off. */
     .recall-list {
       flex: 1 1 auto;
       min-height: 0;
@@ -234,7 +234,7 @@
       color: #4a5864;
     }
 
-    /* Stack the panels on narrow screens. */
+    /* Narrow screens: stack the panels instead of side by side. */
     @media (max-width: 800px) {
       .app-main {
         flex-direction: column;
