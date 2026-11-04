@@ -305,7 +305,6 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
     )
     state = ClientState(ws=ws, pending_finals=deque(),
                         pending_active=pending,
-                        last_final=(last_segment, last_revision),
                         client_id=client_id)
     # Register the client before live source updates can be distributed to it.
     clients[ws] = state

@@ -48,7 +48,6 @@ class ClientState:
   ws : object # WebSocket Object
   pending_finals : deque[Caption]  # Final captions waiting for delivery.
   pending_active : Caption | None  # Newest provisional caption waiting for delivery.
-  last_final : tuple[int, int]  # Client checkpoint as segment and revision.
   client_id : object = None # Identifier received in CLIENT_HELLO.
   wake : asyncio.Event = field(default_factory=asyncio.Event) # Notifies the sender about new work.
   sender : asyncio.Task | None = None  # Task that writes to this client's socket.
