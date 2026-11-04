@@ -2,10 +2,10 @@
 
 ## Team members
 
-- Lim Jinle, Alexius / <Matric number> / <responsibility>
-- Ong Li Min / <Matric number> / <responsibility>
-- James Chin Jia Jun / <Matric number> / <responsibility>
-- Tey Kai Jie / <Matric number> / <responsibility>
+- Lim Jinle, Alexius / A0309160M / flow control
+- Ong Li Min / A0309313M / client logic and UI
+- James Chin Jia Jun / <Matric number> / revision replacement
+- Tey Kai Jie / <Matric number> / reconnection
 
 ## Overview
 
@@ -73,6 +73,12 @@ Optional memory observation in another terminal:
 ```bash
 python monitor_server.py --match solution_server.py --duration 60 --output t3_memory.csv
 ```
+
+`monitor_server.py` is an optional Ubuntu observation tool. It locates the
+server process and records its resident set size at regular intervals in a
+CSV file. The output can be used to check that per-client queues and bounded
+history remain within a predictable memory range during the experiment. The
+monitor does not change the server or the grading protocol.
 
 ### T4 – Reconnect and recovery
 
@@ -164,7 +170,25 @@ Each browser client has an independent outgoing queue and sender task. As a resu
 
 The flow-control manager uses three states. In `NORMAL`, both finalized captions and provisional updates may be sent. If a ping becomes overdue, the client enters `BEHIND`: provisional updates are held, but finalized captions continue to be delivered. A second late pong within the configured lag interval indicates sustained lag and moves the client to `FINALS_ONLY`, where the server sends finalized captions without issuing further probes. After a bounded recovery period, the client returns to `NORMAL` and provisional delivery is attempted again. This prevents fast pongs from an already-throttled client from being mistaken for full recovery.
 
-Finalized captions remain prioritized whenever a client has both finalized and provisional updates waiting. Reconnect checkpoints advance only after a send succeeds, ensuring that a connection failure during delivery does not cause a finalized caption to be skipped during recovery.
+Finalized captions remain prioritised whenever a client has both finalised and
+provisional updates waiting. Reconnect checkpoints advance only after a send
+succeeds, ensuring that a connection failure during delivery does not cause a
+finalised caption to be skipped during recovery.
+
+The server also performs periodic responsiveness monitoring through
+WebSocket ping and pong messages. A completed pong provides an RTT sample for
+the relevant client. The flow-control policy uses these samples to distinguish
+normal delivery from a client that may be falling behind. Monitoring is kept
+per client so a delayed browser does not affect the delivery policy for other
+clients.
+
+### Optional server monitoring
+
+The repository includes `monitor_server.py` as a lightweight diagnostic tool
+for Ubuntu. It samples the server process resident memory and writes elapsed
+time together with memory usage to a CSV file. This is useful when comparing
+queue behaviour across public experiments but it is not required to run the
+application and it does not participate in caption delivery.
 
 ### Overload behaviour and trade-offs
 
