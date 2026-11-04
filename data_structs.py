@@ -43,7 +43,6 @@ class ClientState:
   ws : object # WebSocket Object
   pending_finals : deque[Caption]
   pending_active : Caption | None
-  last_final : tuple[int, int]  # (segment, revision)
   client_id : object = None # from CLIENT_HELLO, for logs
   wake : asyncio.Event = field(default_factory=asyncio.Event) # tell the sender task there is work to do
                                                               # so each client can be served independently.

@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import json
 import time
+from contextlib import suppress
 from typing import Any
 from collections import deque
 from data_structs import Caption, ClientState, SourceHello, ClientHello
@@ -27,7 +28,6 @@ HISTORY_KEEP_SECONDS = 90 # how long the server keeps finaslied captions
 MAX_HISTORY_SECONDS = 60 # the maximum history a client can request 
 DEFAULT_HISTORY_SECONDS = 30 # default/recall window when the client does not specify one
 MAX_PENDING_FINALS = 256  # maximum for per-client finalized-caption backlog
-STREAM_WINDOW = 10.0 # duration of the window used to measure the source stream rate, which is then used in flow control
 
 
 
@@ -36,7 +36,6 @@ active: Caption | None = None          # newest draft of the current segment
 clients: dict[ServerConnection, ClientState] = {} # keyed by socket
 overloaded_clients: set[ServerConnection] = set()
 rsm: RevisionStateManager | None = None  # created on the first SOURCE_HELLO
-update_times: deque[float] = deque() # source updates used to measure stream rate
 
 # In charge of parsing and validating an incoming caption message from the original source.
 def parse_caption(msg: dict[str, Any]) -> Caption | None:
@@ -81,13 +80,6 @@ def trim_finals_log(now: float) -> None:
     if pruned_seg:
         # Remove the oldest caption from the left side of the deque 
         rsm.prune(pruned_seg)
-
-# Overall, is in charge of calculating how quickly the caption source 
-# is sending updates.
-def stream_rate(now: float) -> float:
-    while update_times and update_times[0] < now - STREAM_WINDOW:
-        update_times.popleft()
-    return len(update_times) / STREAM_WINDOW
 
 # In short, it handles a new provisional caption from the original source
 # and distributes the latest version to every client.
@@ -142,7 +134,7 @@ def on_final(caption: Caption) -> None:
 # Used for logging with respect to the flow control. 
 def log_mode(state: ClientState, now: float) -> None:
     # Print the client's flow-control state whenever it changes.
-    old = state.flow.update_mode(now, stream_rate(now))
+    old = state.flow.update_mode(now)
     # Prevents repeated logs when the client is in the same state
     if old is not None:
         # Also prints the transitions such as client client-3: NORMAL -> BEHIND
@@ -157,8 +149,8 @@ def on_pong(state: ClientState, future: asyncio.Future) -> None:
     # Gets a monotonic time stamp to accurately measure time
     now = time.monotonic()
     # Passes the pong time so that it can: calculate the ping round-trip time, determine if the client
-    # is late, update the reading rate and change between the states. 
-    state.flow.on_pong(now, stream_rate(now))
+    # is late, and change between the states.
+    state.flow.on_pong(now)
     # If state has changed, print a message.
     log_mode(state, now)
     # Wake up the sender so that it can recheck whether a held draft can be resent.
@@ -181,12 +173,11 @@ async def client_sender(state: ClientState) -> None:
                 # send unsent finals first (from oldest to newest)
                 if state.pending_finals:
                     caption = state.pending_finals.popleft()
-                    state.last_final = (caption.segment, caption.revision)
                 # if no more finals left to send, send the actively changing one
                 else:
                     log_mode(state, now)
                     # If there are no pending finals, it checks flow control.
-                    delay = flow.draft_delay(now, stream_rate(now))
+                    delay = flow.draft_delay(now)
                     if delay is None or delay > 0:
                         # Client is behind: hold the draft (a newer one may replace
                         # it). Wait `delay` seconds, or with no timeout (None) until
@@ -201,12 +192,12 @@ async def client_sender(state: ClientState) -> None:
                     state.pending_active = None
                 # Only this per-client task sends through that client's WebSocket.
                 await state.ws.send(json.dumps(caption_to_dict(caption)))
-                flow.on_send()
                 # Ping after sending: the pong only returns once the client has
                 # read up to here, which is how flow control sees its lag.
                 # In short, the pong is how quickly the client is consuming data.
-                if flow.should_probe(now):
-                    flow.on_probe(now)
+                probe_now = time.monotonic()
+                if flow.should_probe(probe_now):
+                    flow.on_probe(probe_now)
                     pong = await state.ws.ping()
                     pong.add_done_callback(lambda fut: on_pong(state, fut))
     except websockets.ConnectionClosed:
@@ -246,13 +237,6 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
                 is_accepted, _ = rsm.process_caption(caption)
                 if not is_accepted:
                     continue
-                now = time.monotonic()
-
-                # Prune update_times so that the flow calculation remains
-                # bounded even if no clients are connected.
-                stream_rate(now)
-
-                update_times.append(now)
 
                 if caption.final:
                     on_final(caption)
@@ -273,17 +257,20 @@ async def handle_source(ws: ServerConnection, hello: SourceHello) -> None:
 
 # It selects the finalised captions in order to send it to a 
 # reconnecting or late-joining client. 
-def history_items(last_segment: int, history_seconds: float, now: float) -> list[Caption]:
+def history_items(last_segment: int, last_revision: int,
+                  history_seconds: float, now: float) -> list[Caption]:
     # Calculating the oldest timestamp that should still be included.
     cutoff = now - history_seconds
     # Returns only captions that satisfy both conditions:
-    # c.segment > last_segment: The client has not already received this segment.
+    # c.segment > last_segment, or the same segment with a newer revision.
     # c.source_ts >= cutoff: the caption is within the requested history window.
 
     # This essentially prevents duplicate captions during reconnect. Additionally, it 
     # also avoids sending captions older than the selected recall period.
     return [c for c in finals_log
-            if c.segment > last_segment and c.source_ts >= cutoff]
+            if (c.segment > last_segment
+                or (c.segment == last_segment and c.revision > last_revision))
+            and c.source_ts >= cutoff]
 
 async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
     client_id = hello.get("client_id")
@@ -300,11 +287,18 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         # Resuming client: recover every final it missed (capped at 60 s),
         history_seconds = MAX_HISTORY_SECONDS
 
-    items = history_items(last_segment, history_seconds, time.time())
-    pending = active if active is not None and active.segment > last_segment else None
+    items = history_items(last_segment, last_revision,
+                          history_seconds, time.time())
+    pending = (
+        active
+        if active is not None
+        and (active.segment > last_segment
+             or (active.segment == last_segment
+                 and active.revision > last_revision))
+        else None
+    )
     state = ClientState(ws=ws, pending_finals=deque(),
-                        pending_active=pending, last_final=(last_segment, last_revision),
-                        client_id=client_id)
+                        pending_active=pending, client_id=client_id)
     clients[ws] = state
     print(f"client connected: id={client_id}; last_segment={last_segment}; "
           f"history={len(items)}; clients={len(clients)}", flush=True)
@@ -326,6 +320,8 @@ async def handle_client(ws: ServerConnection, hello: ClientHello) -> None:
         overloaded_clients.discard(ws)
         if state.sender is not None:
             state.sender.cancel()
+            with suppress(asyncio.CancelledError):
+                await state.sender
         print(f"client disconnected: id={client_id}; mode={state.flow.mode.name}; "
               f"drafts_dropped={state.drafts_dropped}; "
               f"clients={len(clients)}", flush=True)
