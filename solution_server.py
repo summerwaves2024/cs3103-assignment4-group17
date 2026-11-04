@@ -420,8 +420,8 @@ async def main_async(port: int) -> None:
         "0.0.0.0",
         port,
         max_size=2**20,
-        ping_interval=20,
-        ping_timeout=20,
+        # client_monitor owns ping probes and the liveness timeout.
+        ping_interval=None,
     ):
         print(f"LiveRecall baseline listening on ws://0.0.0.0:{port}", flush=True)
         # Confirm that it started successfully.
