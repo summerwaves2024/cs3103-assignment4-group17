@@ -2,10 +2,10 @@
 
 | Member | Main responsibilities | Experiments/report sections | Agreed contribution % |
 |---|---|---|---:|
-| Member 1 | Lim Jinle, Alexius |  |  |
-| Member 2 | Ong Li Min |  |  |
-| Member 3 | James Chin Jia Jun |  |  |
-| Member 4 | Tey Kai Jie |  |  |
+| Lim Jinle, Alexius | flow control |  | 25 |
+| Ong Li Min | client logic and UI | architectural and protocol, limitations, conclusion and future work | 25 |
+| James Chin Jia Jun | revision replacement |  | 25 |
+| Tey Kai Jie | reconnection |  | 25 |
 
 Total contribution should be 100%.
 

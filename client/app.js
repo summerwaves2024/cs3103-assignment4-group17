@@ -1,5 +1,6 @@
-// Browser-side logic for LiveRecall: connection management, caption rendering,
-// reconnect recovery, recall history, scrolling, and panel resizing.
+// Browser-side logic for LiveRecall.
+// This covers connection management and caption rendering.
+// It also covers recovery and panel controls.
 
 // DOM references and client-side configuration.
 const WS_URL = "ws://127.0.0.1:8765";
@@ -15,14 +16,14 @@ const recallOpenButton = document.getElementById("recall-open");
 const recallWindowButtons = document.querySelectorAll("button[data-seconds]");
 const recallLatestButton = document.getElementById("recall-latest");
 
-// Connection, caption, and interface state for this browser tab.
+// Connection state and caption state for this browser tab.
 let ws; // Stores the current WebSocket connection to the server. 
 let lastFinal = { segment: 0, revision: 0 }; // Tracks the newest finalised caption that is received.
 let retryAttempt = 0; // Tracks reconnect attempts and the timer used before trying again.
 let retryTimer = null;
 let resumeFrom = 0; // last final segment this connection resumed from (0 = fresh join)
 let noticeTimer = null; // Stores the timer for temporary notices
-let recallSeconds = 30; // Controls the selected recall window: 15, 30, or 60 seconds
+let recallSeconds = 30; // Controls the selected recall window.
 let recallFollow = false; // whether recall follows newly arriving captions
 let recallJumping = false; // smooth scroll to the newest caption in progress
 const recallRows = new Map(); // segment -> row in the recall list
@@ -68,7 +69,8 @@ function renderRecall() {
   if (recallPanel.hidden) return;
   const cutoff = Date.now() / 1000 - recallSeconds;
 
-  // Keep the newest finalized caption per segment, apply the time window,
+  // Keep the newest finalised caption per segment.
+  // Apply the selected time window
   // and render the results in chronological order.
   const items = [...captions.values()]
     .filter(c => c.final && c.source_ts >= cutoff)
@@ -78,7 +80,7 @@ function renderRecall() {
 
   // Update rows in place so a user who is reading older captions keeps their place.
   //
-  // For rows that left the window, remove them and
+  // For rows that left the window remove them and
   // scroll up by their height so the text being read
   // does not move
   let removedHeight = 0;
@@ -95,7 +97,7 @@ function renderRecall() {
   // Hide the button if the user is no longer following the newest caption.
   recallLatestButton.hidden = recallFollow;
 
-  // Add new captions, in segment order.
+  // Add new captions in segment order.
   for (const caption of items) {
     if (recallRows.has(caption.segment)) continue;
     const row = document.createElement("div");
@@ -123,7 +125,7 @@ function updateLatestButton() {
 }
 
 // Follow the newest caption while the user is at the bottom. Then stop as soon as
-// they scroll up to read, and resume when they scroll back down.
+// they scroll up to read and resume when they scroll back down.
 recallEl.addEventListener("scroll", () => {
   if (recallJumping) return;
   recallFollow =
@@ -171,7 +173,7 @@ function applyCaption(msg) {
 
   // Stores the accepted caption as the latest version of the segment
   captions.set(msg.segment, msg)
-  // Recall contains finalized captions only.
+  // Recall contains finalised captions only.
   if (msg.final) {
       renderRecall()
     }
@@ -207,7 +209,8 @@ function showNotice(text) {
   noticeEl.textContent = text;
   noticeEl.hidden = false;
   clearTimeout(noticeTimer);
-  // Start a new six-second timer; after six seconds, the notice is hidden automatically.
+  // Start a six-second timer.
+  // The notice is then hidden automatically.
   noticeTimer = setTimeout(() => { noticeEl.hidden = true; }, 6000);
 }
 
@@ -252,7 +255,7 @@ function connect() {
   // Handle each server message after decoding its JSON payload.
   ws.addEventListener("message", (event) => {
     const msg = JSON.parse(event.data);
-      // Apply both provisional and finalized caption updates through the same
+      // Apply both provisional and finalised caption updates through the same
       // revision-aware rendering path.
     if (msg.type === "CAPTION_UPDATE") {
       applyCaption(msg);
@@ -266,18 +269,18 @@ function connect() {
       }
 
       // Tell the user whether reconnect recovery found missed captions.
-      // If the client had already been connected, it shows a reconnect message. 
+      // If the client was already connected show a reconnect message.
       const s = recovered === 1 ? "" : "s";
       if (resumeFrom > 0) {
         showNotice(recovered > 0
           ? `Reconnected: recovered ${recovered} missed caption${s}, no duplicates.`
           : "Reconnected. Nothing was missed.");
       } else if (recovered > 0) {
-        // Else, if it is a new client.
+        // Otherwise the client has joined during the lecture.
         showNotice(`Joined mid-lecture: loaded ${recovered} earlier caption${s}.`);
       }
 
-      // Render the source's current provisional caption, if present.
+      // Render the source's current provisional caption when one exists.
       if (msg.active) {
         applyCaption(msg.active)
       }
@@ -289,7 +292,7 @@ function connect() {
   // Reconnect after the WebSocket closes.
   ws.addEventListener("close", () => {
     statusEl.textContent = "Connection lost";
-  // Resume from the latest finalized checkpoint after a backoff delay.
+  // Resume from the latest finalised checkpoint after a backoff delay.
     scheduleReconnect();
   });
 
@@ -302,7 +305,7 @@ function connect() {
 // Change the amount of history shown in the recall panel.
 function setRecallWindow(seconds, followLatest = true) {
   recallSeconds = seconds;
-  // Stores the selected duration, such as 15, 30, or 60.
+  // Store the selected duration.
   recallFollow = followLatest;
 
   // Marks the duration as active for styling and accessibility
@@ -350,18 +353,19 @@ recallOpenButton.addEventListener("click", () => {
 // Closing with the panel's close button.
 document.getElementById("recall-close").addEventListener("click", closeRecall);
 
-// Adds behaviour to the 15s, 30s and 60s buttons; when clicked, the selected duration is passed
-// to the setRecallWindow();
+// Connect the recall buttons to setRecallWindow().
 for (const button of recallWindowButtons) {
   button.addEventListener("click", () => setRecallWindow(Number(button.dataset.seconds)));
 }
 
 // Resize the recall panel by dragging its divider. The selected width is
-// persisted locally, leaving the remaining space to the live-caption view.
+// The width is persisted locally.
+// The remaining space belongs to the live-caption view.
 const RECALL_MIN_WIDTH = 260;
 const RECALL_WIDTH_KEY = "liverecall-recall-width";
 
-// Clamp, apply, and persist the recall panel width.
+// Clamp the recall panel width.
+// Apply the width and persist it locally.
 function setRecallWidth(px) {
   // Defines a function that applies a new width to the recall panel and save it for future visits.
   const width = Math.round(Math.min(Math.max(px, RECALL_MIN_WIDTH), appMainEl.clientWidth * 0.6));
@@ -376,7 +380,8 @@ dividerEl.addEventListener("pointerdown", (event) => {
   dividerEl.setPointerCapture(event.pointerId);
   document.body.classList.add("resizing");
 
-  // The recall panel is on the right, so dragging left makes it wider.
+  // The recall panel is on the right.
+  // Dragging left makes it wider.
   const onMove = (e) => setRecallWidth(startWidth + startX - e.clientX);
   // Stops tracking pointer movement and restores normal cursor/text-selection behaviour.
   const onEnd = () => {
@@ -399,7 +404,8 @@ try {
 // Remove locally retained captions older than the browser's recall window.
 function pruneOldCaptions() {
   const cutoff = Date.now() / 1000 - KEEP_SECONDS;
-  // Removes captions older than 90 seconds from: the browser's caption map, the live-caption DOM, the element lookup map
+  // Remove old captions from the caption map.
+  // Remove the matching live row and element reference.
   for (const [segment, caption] of captions) {
     if (caption.source_ts < cutoff) {
       captions.delete(segment);
