@@ -1,8 +1,9 @@
-# Tracks the newest accepted revision for each caption segment.
-# It validates session and revision ordering.
-# It handles provisional-to-final transitions and rejects stale or duplicate updates.
-# Delivery and recovery
-# are handled by the server rather than by this class.
+# Revision State Manager holds ownership over segments states.
+# - Decides whether to reject or accept updates etc
+# - Should handle provisional-to-final transitions
+# - Identifies out-of-order packets
+#
+# Deciding which packet to resend is someone else's task
 
 from data_structs import Caption
 
@@ -11,36 +12,36 @@ class RevisionStateManager:
         self._session = session
         self._segments: dict[int, Caption] = {}
 
-        # Earliest segment that has not yet been finalised.
+        # The "earliest" segment that still hasn't been finalized
         self._latest_active_seg : int = 1
 
-        # Highest segment removed by prune(). Older segments are outside the
-        # active history window and must not re-enter as new captions.
+        # Highest segment removed by prune(). Anything at or below it has
+        # aged out of history and must not be accepted again as "new".
         self._pruned_upto : int = 0
 
-    # Accept a caption only when it is newer than the stored segment state.
-    # Return whether the caption was accepted and whether it arrived out of order.
+    # Updates segments if caption is accepted (e.g. revision_no not outdated)
+    # out: (is_accepted, is_seg_out_of_order)
     def process_caption(self, c : Caption) -> tuple[bool, bool]:
 
-        # Reject missing or incorrectly typed fields.
+        # Reject malformed captions (missing / wrongly typed fields)
         if not isinstance(c.segment, int) or not isinstance(c.revision, int):
             return False, False
 
-        # Reject updates belonging to another session.
+        # Reject if wrong session
         if c.session != self._session:
             return False, False
                 
         cap_seg_id : int = c.segment
 
-        # Segment identifiers are one-based.
+        # caption_source has no segment id < 1, marking this case as invalid
         if cap_seg_id < 1:
             return False, False
 
-        # This segment has already been pruned from the recovery window.
+        # Segment already aged out of the history window
         if cap_seg_id <= self._pruned_upto:
             return False, False
 
-        # First update for this segment: store it as the current state.
+        # If this Caption is entirely new, add it to segments
         if cap_seg_id not in self._segments:
             is_out_of_order = self.add_to_segments(c, cap_seg_id)
             return True, is_out_of_order
@@ -48,18 +49,17 @@ class RevisionStateManager:
         curr_seg : Caption = self._segments[cap_seg_id]
         revision_diff : int = c.revision - curr_seg.revision 
 
-        # Ignore duplicate or older revisions.
+        # Discard outdated / duplicate revisions
         if revision_diff <= 0 or curr_seg.final:
             return False, False
 
-        # The update is newer and can be accepted even if segments arrive
-        # out of order.
+        # Remainder are all valid segments (not necessarily in order)
         is_out_of_order = self.add_to_segments(c, cap_seg_id)
                 
         return True, is_out_of_order
 
-    # Remove segments at or below seg_id so the manager remains bounded.
-    # The server calls this when finalised captions leave recovery history.
+    # Drops every segment <= seg_id so that _segments stays bounded.
+    # Called by the server when finals leave the history window.
     def prune(self, seg_id : int) -> None:
         if seg_id <= self._pruned_upto:
             return
@@ -80,13 +80,14 @@ class RevisionStateManager:
 
         is_wrong_order = False
 
-        # A segment beyond the earliest active segment arrived out of order;
-        # this is valid but worth reporting to the caller.
+        # If the segment id is beyond the earliest non-final
+        # segment, it's out of order (but we still accept it)
         if seg_id > self._latest_active_seg:
             is_wrong_order = True
 
-        # When a segment becomes final advance the active-segment marker when needed.
-        # Final segments may arrive out of order so the loop is required.
+        # When a final segment is accepted, we check if we need
+        # to adjust the active segment. (Note: an out of order segment
+        # segment may be final and accepted, hence the loop from active)
         elif c.final:
             i = self._latest_active_seg
             while i in self._segments:

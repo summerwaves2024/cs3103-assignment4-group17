@@ -1,17 +1,15 @@
-import asyncio  # Provides the event type and task type used by each client.
-from collections import deque  # Provides the queue used for final captions.
-from dataclasses import dataclass, field  # Provides compact state containers.
-from typing import Literal, NotRequired, TypedDict  # Describes protocol messages.
+import asyncio
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Literal, NotRequired, TypedDict
 
-from flow_control import FlowControl  # Gives each client its own flow policy.
+from flow_control import FlowControl
 
 class SourceHello(TypedDict):
-    # Identifies a connection from the caption source.
     type : Literal["SOURCE_HELLO"]
     session : str
 
 class ClientHello(TypedDict):
-    # Identifies a browser client and its recovery checkpoint.
     type : Literal["CLIENT_HELLO"]
     client_id : int
     session : str
@@ -21,7 +19,6 @@ class ClientHello(TypedDict):
 
 @dataclass
 class Caption:
-    # Stores one provisional or finalised caption revision.
     session : str
     segment : int
     revision : int
@@ -31,7 +28,6 @@ class Caption:
 
     @classmethod
     def from_dict(cls, caption_dict : dict) -> "Caption":
-        # Read protocol fields without changing their values.
         session = caption_dict.get("session")
         segment = caption_dict.get("segment")
         revision = caption_dict.get("revision")
@@ -44,12 +40,13 @@ class Caption:
 
 @dataclass
 class ClientState:
-  # Stores all state that belongs to one browser connection.
   ws : object # WebSocket Object
-  pending_finals : deque[Caption]  # Final captions waiting for delivery.
-  pending_active : Caption | None  # Newest provisional caption waiting for delivery.
-  client_id : object = None # Identifier received in CLIENT_HELLO.
-  wake : asyncio.Event = field(default_factory=asyncio.Event) # Notifies the sender about new work.
-  sender : asyncio.Task | None = None  # Task that writes to this client's socket.
-  drafts_dropped : int = 0 # Count of replaced provisional captions.
-  flow : FlowControl = field(default_factory=FlowControl)  # Per-client flow policy.
+  pending_finals : deque[Caption]
+  pending_active : Caption | None
+  client_id : object = None # from CLIENT_HELLO, for logs
+  wake : asyncio.Event = field(default_factory=asyncio.Event) # tell the sender task there is work to do
+                                                              # so we can individually send rather than broadcast
+  sender : asyncio.Task | None = None
+  drafts_dropped : int = 0 # drafts overwritten before they could be sent
+  flow : FlowControl = field(default_factory=FlowControl)
+  monitor : asyncio.Task | None = None
