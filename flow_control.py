@@ -66,6 +66,7 @@ class FlowControl:
         self.last_rtt = rtt
 
         if not late:
+            self.last_late_t = None
             # Based on RFC 6298 retransmission timer
             if self.srtt is None:
                 self.srtt, self.rttvar = rtt, rtt / 2
@@ -74,13 +75,15 @@ class FlowControl:
                 self.srtt = 0.875 * self.srtt + 0.125 * rtt
             return
 
-        # A second late pong 2-20 s after the last one is a sustained lag, not a
-        # one-off spike, so tranistion to finals only for 60s.
-        sustained = self.last_late_t is not None and LAG_MIN <= now - self.last_late_t <= LAG_MAX
-        if sustained:
+        # Reset the tracked late pong timing after 20s
+        if self.last_late_t is None or now - self.last_late_t > LAG_MAX:
+            self.last_late_t = now
+
+        # If we receive another late pong 2-20s after the tracked late pong timing
+        # Delay is considered sustained, go to FINALS_ONLY
+        if now - self.last_late_t >= LAG_MIN:
             self.finals_only_until = now + FINALS_ONLY_FOR
             self.last_rtt = 0.0  # FINALS_ONLY supersedes BEHIND until retry.
-        self.last_late_t = now
 
     def _late_after(self) -> float:
         """RTT above which a pong counts as late: TCP's RTO rule."""
