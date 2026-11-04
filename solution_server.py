@@ -19,6 +19,7 @@ from contextlib import suppress
 from typing import Any
 from collections import deque
 from data_structs import Caption, ClientState, SourceHello, ClientHello
+from flow_control import MONITOR_INTERVAL
 from revision_state_manager import RevisionStateManager
 
 import websockets
@@ -28,7 +29,6 @@ HISTORY_KEEP_SECONDS = 90 # how long the server keeps finaslied captions
 MAX_HISTORY_SECONDS = 60 # the maximum history a client can request 
 DEFAULT_HISTORY_SECONDS = 30 # default/recall window when the client does not specify one
 MAX_PENDING_FINALS = 256  # maximum for per-client finalized-caption backlog
-MONITOR_INTERVAL = 0.05  # Check flow state even when caption sending is blocked.
 PROBE_TIMEOUT = 20.0     # Includes blocked ping setup as well as a missing pong.
 
 
@@ -148,10 +148,9 @@ def on_pong(state: ClientState, future: asyncio.Future) -> None:
     # Ignores the failed or cancelled pong operations
     if future.cancelled() or future.exception() is not None:
         return
-    # Gets a monotonic time stamp to accurately measure time
+    # Monotonic processing time is used for restriction deadlines.
     now = time.monotonic()
-    # Passes the pong time so that it can: calculate the ping round-trip time, determine if the client
-    # is late, and change between the states.
+    # Classify lateness using the library RTT, not elapsed probe-task time.
     state.flow.on_pong(now, rtt=future.result())
     # If state has changed, print a message.
     log_mode(state, now)
@@ -159,7 +158,7 @@ def on_pong(state: ClientState, future: asyncio.Future) -> None:
     state.wake.set()
 
 async def measure_ping(state: ClientState) -> float:
-    """Use the library's RTT instead of timing the whole ws.ping() call."""
+    """Use library RTT, including queue/network delay but not monitor scheduling."""
     pong = await state.ws.ping()
     # The library owns this future. Consume failures even after cancellation,
     # and shield it so stopping the monitor doesn't cancel library state.
@@ -200,12 +199,13 @@ async def client_monitor(state: ClientState) -> None:
             if flow.mode is not old:
                 state.wake.set()
 
-            # Ping after sending: the pong only returns once the client has
-            # read up to here, which is how flow control sees its lag.
-            # In short, the pong is how quickly the client is consuming data.
+            # Ping shares the ordered transport with captions, so its RTT can
+            # reflect queued caption bytes as well as network/peer delay.
+            # A pong does not establish that caption JavaScript has run.
             # Run independently of sending, including during idle periods and
             # history transfer. Only one ping operation may be outstanding.
             if probe_task is None and flow.should_probe(now):
+                # Overall task age is used only for the hard liveness timeout.
                 probe_started = now
                 flow.on_probe(now)
                 probe_task = asyncio.create_task(measure_ping(state))

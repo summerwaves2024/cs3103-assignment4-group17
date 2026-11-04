@@ -49,3 +49,4 @@ class ClientState:
   sender : asyncio.Task | None = None
   drafts_dropped : int = 0 # drafts overwritten before they could be sent
   flow : FlowControl = field(default_factory=FlowControl)
+  monitor : asyncio.Task | None = None
