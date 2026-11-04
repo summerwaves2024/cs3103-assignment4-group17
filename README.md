@@ -150,6 +150,31 @@ Open another browser window after the source has been running for a while. It sh
 
 Close or temporarily disconnect one browser client, wait briefly, and reconnect it. The client should recover missed finalized captions and display a reconnect notice without creating duplicate rows.
 
+### Optional: slow-client demo with `tools/slow_proxy.py`
+
+A slow browser tab does not slow down WebSocket pongs, because the browser answers pings outside the page's JavaScript. To show flow control with real browsers, `tools/slow_proxy.py` sits between the tabs and the server and limits how fast each connection receives data, so a throttled tab is slow on the network. It is a demo helper only and is not part of the evaluated server.
+
+The browser client always connects to port 8765, so the proxy listens there and the server moves to 8767. Run each command in its own terminal:
+
+```bash
+python solution_server.py --port 8767                        # server
+python tools/slow_proxy.py --listen 8765 --target 8767       # proxy (browser tabs connect here)
+python -m http.server 8000 --directory client                # browser client
+python caption_source.py --uri ws://127.0.0.1:8767 --duration 180   # source, after opening the tabs
+```
+
+Open two tabs at [http://127.0.0.1:8000](http://127.0.0.1:8000), then type commands into the proxy terminal. Rates are bytes per second from the server to the client; `0` means unthrottled.
+
+| Command | Effect |
+|---|---|
+| `list` | Show connections (`[1]`, `[2]`, ...) and their rates |
+| `<id> <rate>` | Throttle one connection, e.g. `2 100` |
+| `all <rate>` | Throttle every connection, including ones opened later |
+
+Throttling a tab with `2 100` makes it fall behind. Within about 10–20 s the server log shows `NORMAL -> BEHIND -> FINALS_ONLY` for that client, and the tab keeps receiving finalized captions while the other tab still receives every revision. `2 0` removes the limit. Once the finals-only period ends (60 s), the server log shows `FINALS_ONLY -> NORMAL` and provisional captions resume.
+
+At about 200 B/s a tab barely lags, 100 B/s is an appropriate amount of lag to demonstrate a slow client, and around 50 B/s even finalized captions alone cannot keep up. Refreshing a tab opens a new connection with the default rate, so use `list` to find its new id.
+
 ## Design notes
 
 ### Revision and deduplication state
@@ -171,9 +196,9 @@ Each browser client has an independent outgoing queue and sender task. As a resu
 The flow-control manager uses three states. In `NORMAL`, both finalized captions and provisional updates may be sent. If a ping becomes overdue, the client enters `BEHIND`: provisional updates are held, but finalized captions continue to be delivered. A second late pong within the configured lag interval indicates sustained lag and moves the client to `FINALS_ONLY`, where the server sends finalized captions without issuing further probes. After a bounded recovery period, the client returns to `NORMAL` and provisional delivery is attempted again. This prevents fast pongs from an already-throttled client from being mistaken for full recovery.
 
 Finalized captions remain prioritised whenever a client has both finalised and
-provisional updates waiting. Reconnect checkpoints advance only after a send
-succeeds, ensuring that a connection failure during delivery does not cause a
-finalised caption to be skipped during recovery.
+provisional updates waiting. Recovery uses the checkpoint the client reports in
+`CLIENT_HELLO`, not a record of what the server sent, so a caption lost when a
+connection drops mid-delivery is still resent on reconnect.
 
 The server also performs periodic responsiveness monitoring through
 WebSocket ping and pong messages. A completed pong provides an RTT sample for
