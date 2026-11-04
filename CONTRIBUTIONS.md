@@ -2,7 +2,7 @@
 
 | Member | Main responsibilities | Experiments/report sections | Agreed contribution % |
 |---|---|---|---:|
-| Lim Jinle, Alexius |  flow-control |  | 25 |
+| Lim Jinle, Alexius | per-client sender task (from naive broadcast) and flow-control | public experiments analysis and optimisation comparison analysis | 25 |
 | Ong Li Min | client logic and UI, documentation including code comments and .md files. | architectural and protocol, limitations, conclusion and future work | 25 |
 | James Chin Jia Jun | revision replacement, minor changes in flow control | flow-control explanation, experiment results | 25 |
 | Tey Kai Jie | reconnection logic | demo video, general report formatting and revision/recovery semantics | 25 |
