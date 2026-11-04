@@ -5,7 +5,7 @@
 - Lim Jinle, Alexius / A0309160M / flow control
 - Ong Li Min / A0309313M / client logic and UI
 - James Chin Jia Jun / <Matric number> / revision replacement
-- Tey Kai Jie / <Matric number> / reconnection
+- Tey Kai Jie / A0305815H / reconnection
 
 ## Overview
 
