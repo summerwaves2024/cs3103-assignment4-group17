@@ -46,7 +46,7 @@ class ClientState:
   last_final : tuple[int, int]  # (segment, revision)
   client_id : object = None # from CLIENT_HELLO, for logs
   wake : asyncio.Event = field(default_factory=asyncio.Event) # tell the sender task there is work to do
-                                                              # so we can individually send rather than broadcast
+                                                              # so each client can be served independently.
   sender : asyncio.Task | None = None
   drafts_dropped : int = 0 # drafts overwritten before they could be sent
   flow : FlowControl = field(default_factory=FlowControl)
