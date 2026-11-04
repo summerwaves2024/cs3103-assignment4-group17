@@ -4,8 +4,8 @@
 |---|---|---|---:|
 | Lim Jinle, Alexius |  flow-control |  | 25 |
 | Ong Li Min | client logic and UI, documentation including code comments and .md files. | architectural and protocol, limitations, conclusion and future work | 25 |
-| James Chin Jia Jun | revision replacement, flow-control explaination |  | 25 |
-| Tey Kai Jie | reconnection, demo video |  | 25 |
+| James Chin Jia Jun | revision replacement, minor changes in flow control | flow-control explanation, experiment results | 25 |
+| Tey Kai Jie | reconnection logic | demo video, general report formatting and revision/recovery semantics | 25 |
 
 Total contribution should be 100%.
 
