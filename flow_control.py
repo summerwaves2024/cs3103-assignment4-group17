@@ -17,7 +17,7 @@ class FlowControl:
     def __init__(self):
         self.srtt : float | None = None         # smoothed RTT of on-time pongs
         self.rttvar = 0.0                       # and its variation
-        self.probe_t : float | None = None      # outstanding probe timeout marker; not an RTT clock
+        self.probe_t : float | None = None      # ping issuance time for detecting an overdue pong
         self.last_rtt = 0.0
         self.last_probe_t = 0.0
         self.last_late_t : float | None = None  # time of the last late pong
@@ -26,10 +26,15 @@ class FlowControl:
 
     def state(self, now : float) -> ClientStatus:
         """Which flow-control state the client is in right now."""
-        if self.last_rtt is not None and self.last_rtt > self._late_after():
-            return ClientStatus.BEHIND
         if now < self.finals_only_until:
             return ClientStatus.FINALS_ONLY
+
+        overdue = (
+            self.probe_t is not None
+            and now - self.probe_t > self._late_after()
+        )
+        if overdue or (self.last_rtt is not None and self.last_rtt > self._late_after()):
+            return ClientStatus.BEHIND
         return ClientStatus.NORMAL
 
     def update_mode(self, now : float) -> ClientStatus | None:
